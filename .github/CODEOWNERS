@@ -1,0 +1,8 @@
+# Core code - maintainer only
+/src/ @TomGranot
+/container/ @TomGranot
+/package.json @TomGranot
+/package-lock.json @TomGranot
+
+# Skills - open to contributors
+/.claude/skills/
