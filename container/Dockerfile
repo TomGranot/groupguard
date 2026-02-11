@@ -29,6 +29,9 @@ RUN apt-get update && apt-get install -y \
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
+# Prefer IPv4 DNS results to avoid IPv6 routing issues with vmnet NAT
+ENV NODE_OPTIONS="--dns-result-order=ipv4first"
+
 # Install agent-browser and claude-code globally
 RUN npm install -g agent-browser @anthropic-ai/claude-code
 

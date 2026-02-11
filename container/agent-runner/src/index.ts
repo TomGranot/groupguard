@@ -272,6 +272,7 @@ async function main(): Promise<void> {
       result,
       newSessionId
     });
+    process.exit(0);
 
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);

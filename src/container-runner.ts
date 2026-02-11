@@ -157,7 +157,7 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
 }
 
 function buildContainerArgs(mounts: VolumeMount[]): string[] {
-  const args: string[] = ['run', '-i', '--rm'];
+  const args: string[] = ['run', '-i', '--rm', '-e', 'NODE_OPTIONS=--dns-result-order=ipv4first'];
 
   // Apple Container: --mount for readonly, -v for read-write
   for (const mount of mounts) {

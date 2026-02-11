@@ -164,7 +164,11 @@ async function processMessage(msg: NewMessage): Promise<void> {
 
   if (response) {
     lastAgentTimestamp[msg.chat_jid] = msg.timestamp;
-    await sendMessage(msg.chat_jid, `${ASSISTANT_NAME}: ${response}`);
+    // Strip <internal>...</internal> blocks — these are agent reasoning, not user-facing
+    const cleaned = response.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+    if (cleaned) {
+      await sendMessage(msg.chat_jid, `${ASSISTANT_NAME}: ${cleaned}`);
+    }
   }
 }
 
@@ -318,12 +322,14 @@ async function processTaskIpc(
     context_mode?: string;
     groupFolder?: string;
     chatJid?: string;
-    // For register_group
+    // For register_group / update_group_config
     jid?: string;
     name?: string;
     folder?: string;
     trigger?: string;
     containerConfig?: RegisteredGroup['containerConfig'];
+    guards?: RegisteredGroup['guards'];
+    moderationConfig?: RegisteredGroup['moderationConfig'];
   },
   sourceGroup: string,  // Verified identity from IPC directory
   isMain: boolean       // Verified from directory path
@@ -468,6 +474,27 @@ async function processTaskIpc(
       }
       break;
 
+    case 'update_group_config':
+      // Only main group can update guard/moderation configs
+      if (!isMain) {
+        logger.warn({ sourceGroup }, 'Unauthorized update_group_config attempt blocked');
+        break;
+      }
+      if (data.jid && registeredGroups[data.jid]) {
+        const group = registeredGroups[data.jid];
+        if (data.guards !== undefined) {
+          group.guards = data.guards as RegisteredGroup['guards'];
+        }
+        if (data.moderationConfig !== undefined) {
+          group.moderationConfig = data.moderationConfig as RegisteredGroup['moderationConfig'];
+        }
+        saveJson(path.join(DATA_DIR, 'registered_groups.json'), registeredGroups);
+        logger.info({ jid: data.jid, guards: group.guards?.length || 0, observationMode: group.moderationConfig?.observationMode }, 'Group config updated via IPC');
+      } else {
+        logger.warn({ jid: data.jid }, 'update_group_config: group not found');
+      }
+      break;
+
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
   }
@@ -546,6 +573,9 @@ async function connectWhatsApp(): Promise<void> {
       if (!msg.message) continue;
       const chatJid = msg.key.remoteJid;
       if (!chatJid || chatJid === 'status@broadcast') continue;
+
+      // Skip protocol messages (deletions, edits, reactions, etc.) — not real content
+      if (msg.message.protocolMessage || msg.message.reactionMessage || msg.message.editedMessage) continue;
 
       const timestamp = new Date(Number(msg.messageTimestamp) * 1000).toISOString();
 

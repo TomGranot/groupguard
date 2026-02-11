@@ -76,8 +76,14 @@ export async function moderateMessage(
   moderationConfig: ModerationConfig | undefined,
 ): Promise<boolean> {
   if (!msg.key || !msg.message) return false;
-  // Don't moderate the bot's own messages
-  if (msg.key.fromMe) return false;
+  // Don't moderate the bot's own outgoing responses (prefixed with assistant name)
+  // Note: fromMe is true for ALL messages from this WhatsApp account (including the owner),
+  // so we can't use fromMe alone — we check message content to identify bot responses.
+  if (msg.key.fromMe) {
+    const m = msg.message;
+    const text = m?.conversation || m?.extendedTextMessage?.text || '';
+    if (text.startsWith(`${ASSISTANT_NAME}:`)) return false;
+  }
   // Only moderate group messages
   if (!chatJid.endsWith('@g.us')) return false;
   // No guards configured for this group

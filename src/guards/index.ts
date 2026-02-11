@@ -106,4 +106,5 @@ export function evaluateGuards(
 }
 
 // Re-export types
-export { Guard, GuardResult, GuardContext, GroupGuardConfig, ModerationConfig, DEFAULT_MODERATION_CONFIG } from './types.js';
+export type { Guard, GuardResult, GuardContext, GroupGuardConfig, ModerationConfig } from './types.js';
+export { DEFAULT_MODERATION_CONFIG } from './types.js';

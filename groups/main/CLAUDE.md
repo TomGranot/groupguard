@@ -161,18 +161,45 @@ Query the database or read the source to list guards. Here's the full list:
 | `no-spam` | Rate limit rapid messages | `maxMessages` (default: 5), `windowSeconds` (default: 10) |
 | `approved-senders` | Whitelist only | `allowedJids` (string[]) |
 
-### Enabling a Guard
+### Enabling/Disabling Guards (IPC)
 
-To enable a guard for a group, add it to the group's `guards` array in `registered_groups.json`:
+**IMPORTANT:** Do NOT edit `registered_groups.json` directly — the host process won't reload it. Use the `update_group_config` IPC command instead, which updates the live config immediately:
 
-```json
+```bash
+# Enable guards for a group
+cat > /workspace/ipc/tasks/config_$(date +%s%N).json << 'EOF'
 {
+  "type": "update_group_config",
+  "jid": "120363422834835417@g.us",
   "guards": [
     { "guardId": "no-spam", "enabled": true },
     { "guardId": "no-links", "enabled": true },
     { "guardId": "keyword-filter", "enabled": true, "params": { "keywords": ["spam", "promo"] } }
-  ]
+  ],
+  "moderationConfig": {
+    "observationMode": false,
+    "adminExempt": true,
+    "dmCooldownSeconds": 60
+  }
 }
+EOF
+```
+
+To disable a specific guard, send the full guards array with that guard removed or set `enabled: false`.
+
+To update only moderation config (without changing guards), omit the `guards` field:
+```bash
+cat > /workspace/ipc/tasks/config_$(date +%s%N).json << 'EOF'
+{
+  "type": "update_group_config",
+  "jid": "120363422834835417@g.us",
+  "moderationConfig": {
+    "observationMode": true,
+    "adminExempt": true,
+    "dmCooldownSeconds": 60
+  }
+}
+EOF
 ```
 
 ### Viewing Moderation Logs
@@ -205,11 +232,13 @@ sqlite3 /workspace/project/store/messages.db "
 
 When an admin asks to manage guards, follow this pattern:
 
-1. **"Enable X guard for Y group"**: Read `registered_groups.json`, add the guard to the group's `guards` array, write it back.
-2. **"Disable X guard for Y group"**: Set `enabled: false` or remove from the array.
+1. **"Enable X guard for Y group"**: Read current config from `registered_groups.json`, build the updated guards array, send `update_group_config` IPC command.
+2. **"Disable X guard for Y group"**: Same as above, but with guard removed or `enabled: false`.
 3. **"Show moderation stats for Y group"**: Query `moderation_log` table.
-4. **"Enable observation mode"**: Set `moderationConfig.observationMode: true`.
-5. **"Start enforcing"**: Set `moderationConfig.observationMode: false`.
+4. **"Enable observation mode"**: Send `update_group_config` IPC with `moderationConfig.observationMode: true`.
+5. **"Start enforcing"**: Send `update_group_config` IPC with `moderationConfig.observationMode: false`.
+
+Always read the CURRENT config from `registered_groups.json` first, then modify and send via IPC. This ensures you don't overwrite other settings.
 
 Always confirm the action back to the admin.
 
