@@ -24,6 +24,7 @@ import { initDatabase, storeMessage, storeChatMetadata, getNewMessages, getMessa
 import { startSchedulerLoop } from './task-scheduler.js';
 import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot, AvailableGroup } from './container-runner.js';
 import { loadJson, saveJson } from './utils.js';
+import { initModerator, moderateMessage, refreshAdminCache, updateAdminCache } from './moderator.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -482,7 +483,7 @@ async function connectWhatsApp(): Promise<void> {
     auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
     printQRInTerminal: false,
     logger,
-    browser: ['NanoClaw', 'Chrome', '1.0.0']
+    browser: ['GroupGuard', 'Chrome', '1.0.0']
   });
 
   sock.ev.on('connection.update', (update) => {
@@ -509,6 +510,19 @@ async function connectWhatsApp(): Promise<void> {
       }
     } else if (connection === 'open') {
       logger.info('Connected to WhatsApp');
+
+      // Initialize moderation system
+      initModerator(sock);
+
+      // Refresh admin caches for all registered groups
+      for (const chatJid of Object.keys(registeredGroups)) {
+        if (chatJid.endsWith('@g.us')) {
+          refreshAdminCache(chatJid).catch(err =>
+            logger.warn({ chatJid, err }, 'Failed to refresh admin cache on startup')
+          );
+        }
+      }
+
       // Sync group metadata on startup (respects 24h cache)
       syncGroupMetadata().catch(err => logger.error({ err }, 'Initial group sync failed'));
       // Set up daily sync timer
@@ -527,7 +541,7 @@ async function connectWhatsApp(): Promise<void> {
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('messages.upsert', ({ messages }) => {
+  sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
       if (!msg.message) continue;
       const chatJid = msg.key.remoteJid;
@@ -538,16 +552,39 @@ async function connectWhatsApp(): Promise<void> {
       // Always store chat metadata for group discovery
       storeChatMetadata(chatJid, timestamp);
 
-      // Only store full message content for registered groups
+      // Only process full message content for registered groups
       if (registeredGroups[chatJid]) {
+        const group = registeredGroups[chatJid];
+
+        // Run moderation guards BEFORE storing the message
+        if (group.guards && group.guards.length > 0) {
+          const blocked = await moderateMessage(
+            msg,
+            chatJid,
+            group.guards,
+            group.moderationConfig,
+          );
+          if (blocked) continue; // Skip storing blocked messages
+        }
+
         storeMessage(msg, chatJid, msg.key.fromMe || false, msg.pushName || undefined);
       }
+    }
+  });
+
+  // Track group membership changes for admin cache updates
+  sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
+    logger.info({ chatJid: id, action, count: participants.length }, 'Group participants updated');
+
+    // Refresh admin cache when participants change
+    if (registeredGroups[id]) {
+      await refreshAdminCache(id);
     }
   });
 }
 
 async function startMessageLoop(): Promise<void> {
-  logger.info(`NanoClaw running (trigger: @${ASSISTANT_NAME})`);
+  logger.info(`GroupGuard running (trigger: @${ASSISTANT_NAME})`);
 
   while (true) {
     try {

@@ -60,6 +60,22 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_task_run_logs ON task_run_logs(task_id, run_at);
   `);
 
+  // Moderation log table
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS moderation_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_jid TEXT NOT NULL,
+      sender_jid TEXT NOT NULL,
+      guard_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      message_id TEXT,
+      timestamp TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_modlog_chat ON moderation_log(chat_jid, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_modlog_sender ON moderation_log(sender_jid, timestamp);
+  `);
+
   // Add sender_name column if it doesn't exist (migration for existing DBs)
   try {
     db.exec(`ALTER TABLE messages ADD COLUMN sender_name TEXT`);
@@ -281,4 +297,51 @@ export function getTaskRunLogs(taskId: string, limit = 10): TaskRunLog[] {
     ORDER BY run_at DESC
     LIMIT ?
   `).all(taskId, limit) as TaskRunLog[];
+}
+
+// --- Moderation log ---
+
+export interface ModerationLogEntry {
+  chat_jid: string;
+  sender_jid: string;
+  guard_id: string;
+  action: string;
+  reason: string;
+  message_id: string;
+  timestamp: string;
+}
+
+export function logModeration(entry: ModerationLogEntry): void {
+  db.prepare(`
+    INSERT INTO moderation_log (chat_jid, sender_jid, guard_id, action, reason, message_id, timestamp)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    entry.chat_jid,
+    entry.sender_jid,
+    entry.guard_id,
+    entry.action,
+    entry.reason,
+    entry.message_id,
+    entry.timestamp,
+  );
+}
+
+export function getModerationLogs(chatJid: string, limit = 50): ModerationLogEntry[] {
+  return db.prepare(`
+    SELECT chat_jid, sender_jid, guard_id, action, reason, message_id, timestamp
+    FROM moderation_log
+    WHERE chat_jid = ?
+    ORDER BY timestamp DESC
+    LIMIT ?
+  `).all(chatJid, limit) as ModerationLogEntry[];
+}
+
+export function getModerationStats(chatJid: string): Array<{ guard_id: string; count: number }> {
+  return db.prepare(`
+    SELECT guard_id, COUNT(*) as count
+    FROM moderation_log
+    WHERE chat_jid = ?
+    GROUP BY guard_id
+    ORDER BY count DESC
+  `).all(chatJid) as Array<{ guard_id: string; count: number }>;
 }

@@ -1,7 +1,7 @@
 {
-  "name": "nanoclaw",
-  "version": "1.0.0",
-  "description": "Personal Claude assistant. Lightweight, secure, customizable.",
+  "name": "groupguard",
+  "version": "0.1.0",
+  "description": "WhatsApp group moderation bot. Built on NanoClaw.",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {

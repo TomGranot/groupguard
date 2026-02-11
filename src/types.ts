@@ -39,6 +39,8 @@ export interface RegisteredGroup {
   trigger: string;
   added_at: string;
   containerConfig?: ContainerConfig;
+  guards?: Array<{ guardId: string; enabled: boolean; params?: Record<string, unknown> }>;
+  moderationConfig?: { observationMode: boolean; adminExempt: boolean; dmCooldownSeconds: number };
 }
 
 export interface Session {
