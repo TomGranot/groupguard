@@ -1,8 +1,8 @@
 # Core code - maintainer only
-/src/ @gavrielc
-/container/ @gavrielc
-/package.json @gavrielc
-/package-lock.json @gavrielc
+/src/ @TomGranot
+/container/ @TomGranot
+/package.json @TomGranot
+/package-lock.json @TomGranot
 
 # Skills - open to contributors
 /.claude/skills/

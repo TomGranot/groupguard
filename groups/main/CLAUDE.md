@@ -64,7 +64,7 @@ Available groups are provided in `/workspace/ipc/available_groups.json`:
 {
   "groups": [
     {
-      "jid": "120363336345536173@g.us",
+      "jid": "1234567890-1234567890@g.us",
       "name": "Family Chat",
       "lastActivity": "2026-01-31T12:00:00.000Z",
       "isRegistered": false
@@ -170,7 +170,7 @@ Query the database or read the source to list guards. Here's the full list:
 cat > /workspace/ipc/tasks/config_$(date +%s%N).json << 'EOF'
 {
   "type": "update_group_config",
-  "jid": "120363422834835417@g.us",
+  "jid": "1234567890-1234567890@g.us",
   "guards": [
     { "guardId": "no-spam", "enabled": true },
     { "guardId": "no-links", "enabled": true },
@@ -192,7 +192,7 @@ To update only moderation config (without changing guards), omit the `guards` fi
 cat > /workspace/ipc/tasks/config_$(date +%s%N).json << 'EOF'
 {
   "type": "update_group_config",
-  "jid": "120363422834835417@g.us",
+  "jid": "1234567890-1234567890@g.us",
   "moderationConfig": {
     "observationMode": true,
     "adminExempt": true,
@@ -208,7 +208,7 @@ EOF
 sqlite3 /workspace/project/store/messages.db "
   SELECT timestamp, sender_jid, guard_id, action, reason
   FROM moderation_log
-  WHERE chat_jid = '120363336345536173@g.us'
+  WHERE chat_jid = '1234567890-1234567890@g.us'
   ORDER BY timestamp DESC
   LIMIT 20;
 "
@@ -220,7 +220,7 @@ sqlite3 /workspace/project/store/messages.db "
 sqlite3 /workspace/project/store/messages.db "
   SELECT guard_id, COUNT(*) as violations
   FROM moderation_log
-  WHERE chat_jid = '120363336345536173@g.us'
+  WHERE chat_jid = '1234567890-1234567890@g.us'
   GROUP BY guard_id
   ORDER BY violations DESC;
 "

@@ -100,7 +100,7 @@ launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist
 
 User: "Add Telegram as an input channel"
 
-1. Ask: "Should Telegram use the same @Andy trigger, or a different one?"
+1. Ask: "Should Telegram use the same @GroupGuard trigger, or a different one?"
 2. Ask: "Should Telegram messages create separate conversation contexts, or share with WhatsApp groups?"
 3. Find Telegram MCP or library
 4. Add connection handling in index.ts
