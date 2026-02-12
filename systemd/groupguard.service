@@ -1,0 +1,20 @@
+[Unit]
+Description=GroupGuard - WhatsApp Claude Assistant
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node dist/index.js
+WorkingDirectory={{PROJECT_ROOT}}
+Environment=NODE_ENV=production
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+User={{USER}}
+Restart=always
+RestartSec=5
+
+StandardOutput=append:{{PROJECT_ROOT}}/logs/groupguard.log
+StandardError=append:{{PROJECT_ROOT}}/logs/groupguard.error.log
+
+[Install]
+WantedBy=multi-user.target

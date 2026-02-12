@@ -1,167 +1,229 @@
-<p align="center">
-  <img src="assets/nanoclaw-logo.png" alt="NanoClaw" width="400">
-</p>
+# GroupGuard
 
-<p align="center">
-  My personal Claude assistant that runs securely in containers. Lightweight and built to be understood and customized for your own needs.
-</p>
+WhatsApp group moderation powered by Claude. Automated content filtering, spam prevention, and natural-language admin controls — all running in isolated containers.
 
-## Why I Built This
+Built on [NanoClaw](https://github.com/gavrielc/nanoclaw).
 
-[OpenClaw](https://github.com/openclaw/openclaw) is an impressive project with a great vision. But I can't sleep well running software I don't understand with access to my life. OpenClaw has 52+ modules, 8 config management files, 45+ dependencies, and abstractions for 15 channel providers. Security is application-level (allowlists, pairing codes) rather than OS isolation. Everything runs in one Node process with shared memory.
+## What It Does
 
-NanoClaw gives you the same core functionality in a codebase you can understand in 8 minutes. One process. A handful of files. Agents run in actual Linux containers with filesystem isolation, not behind permission checks.
+GroupGuard sits in your WhatsApp groups and enforces rules automatically. Messages that violate rules get deleted instantly, and the sender gets a private explanation. Admins control everything through natural language — just tell the bot what you want.
+
+```
+@GroupGuard enable no-spam and no-links for Family Chat
+@GroupGuard set observation mode for Work Team (log violations but don't delete)
+@GroupGuard show moderation stats for the last week
+@GroupGuard disable quiet-hours for the Main group
+```
+
+Beyond moderation, it's a full Claude assistant — it can answer questions, search the web, schedule tasks, and manage files. The moderation just runs silently in the background.
+
+## Guards
+
+14 built-in rules organized into four categories:
+
+**Content Type** — what format is allowed
+| Guard | What it does |
+|-------|-------------|
+| `text-only` | Only allow text messages |
+| `video-only` | Only allow video messages |
+| `voice-only` | Only allow voice notes |
+| `media-only` | Only allow media, block text |
+| `no-stickers` | Block stickers |
+| `no-images` | Block images |
+
+**Content Property** — message characteristics
+| Guard | What it does | Config |
+|-------|-------------|--------|
+| `no-links` | Block URLs | — |
+| `no-forwarded` | Block forwarded messages | — |
+| `max-text-length` | Block long messages | `maxLength` (default: 2000) |
+| `keyword-filter` | Block keywords or regex patterns | `keywords`, `patterns` |
+
+**Behavioral** — rate limiting and access control
+| Guard | What it does | Config |
+|-------|-------------|--------|
+| `no-spam` | Block rapid-fire messages | `maxMessages` (5), `windowSeconds` (10) |
+| `slow-mode` | One message per N minutes | `intervalMinutes` (5) |
+| `quiet-hours` | Block during certain hours | `startHour` (22), `endHour` (7) |
+| `approved-senders` | Whitelist-only mode | `allowedJids` |
+
+Guards run on the host process, not inside the container — enforcement is instant. Messages blocked by guards never reach the database.
+
+## How Moderation Works
+
+```
+Message arrives
+    |
+    v
+Is sender a group admin?  -->  Yes: skip guards (if adminExempt=true)
+    |
+    No
+    v
+Run all enabled guards for this group
+    |
+    v
+Any guard blocks?  -->  No: store message, process normally
+    |
+    Yes
+    v
+Observation mode?  -->  Yes: log violation, store message anyway
+    |
+    No
+    v
+Delete message + DM sender with reason + log violation
+```
+
+Each group has independent guard configurations and a moderation config:
+
+```json
+{
+  "guards": [
+    { "guardId": "no-spam", "enabled": true, "params": { "maxMessages": 5 } },
+    { "guardId": "no-links", "enabled": true }
+  ],
+  "moderationConfig": {
+    "observationMode": false,
+    "adminExempt": true,
+    "dmCooldownSeconds": 60
+  }
+}
+```
+
+- **Observation mode**: Log violations without deleting — useful for testing rules before enforcing
+- **Admin exempt**: Group admins bypass all guards
+- **DM cooldown**: Prevent notification spam (one DM per user per 60s)
+
+All violations are logged to SQLite with timestamp, sender, guard ID, action, and reason.
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/gavrielc/nanoclaw.git
-cd nanoclaw
-claude
+git clone git@github.com:TomGranot/groupguard.git
+cd groupguard
+./setup.sh
 ```
 
-Then run `/setup`. Claude Code handles everything: dependencies, authentication, container setup, service configuration.
+Or use Claude Code for guided setup: run `claude` then `/setup`.
 
-## Philosophy
-
-**Small enough to understand.** One process, a few source files. No microservices, no message queues, no abstraction layers. Have Claude Code walk you through it.
-
-**Secure by isolation.** Agents run in Linux containers (Apple Container on macOS, or Docker). They can only see what's explicitly mounted. Bash access is safe because commands run inside the container, not on your host.
-
-**Built for one user.** This isn't a framework. It's working software that fits my exact needs. You fork it and have Claude Code make it match your exact needs.
-
-**Customization = code changes.** No configuration sprawl. Want different behavior? Modify the code. The codebase is small enough that this is safe.
-
-**AI-native.** No installation wizard; Claude Code guides setup. No monitoring dashboard; ask Claude what's happening. No debugging tools; describe the problem, Claude fixes it.
-
-**Skills over features.** Contributors shouldn't add features (e.g. support for Telegram) to the codebase. Instead, they contribute [claude code skills](https://code.claude.com/docs/en/skills) like `/add-telegram` that transform your fork. You end up with clean code that does exactly what you need.
-
-**Best harness, best model.** This runs on Claude Agent SDK, which means you're running Claude Code directly. The harness matters. A bad harness makes even smart models seem dumb, a good harness gives them superpowers. Claude Code is (IMO) the best harness available.
-
-**No ToS gray areas.** Because it uses Claude Agent SDK natively with no hacks or workarounds, using your subscription with your auth token is completely legitimate (I think). No risk of being shut down for terms of service violations (I am not a lawyer).
-
-## What It Supports
-
-- **WhatsApp I/O** - Message Claude from your phone
-- **Isolated group context** - Each group has its own `CLAUDE.md` memory, isolated filesystem, and runs in its own container sandbox with only that filesystem mounted
-- **Main channel** - Your private channel (self-chat) for admin control; every other group is completely isolated
-- **Scheduled tasks** - Recurring jobs that run Claude and can message you back
-- **Web access** - Search and fetch content
-- **Container isolation** - Agents sandboxed in Apple Container (macOS) or Docker (macOS/Linux)
-- **Optional integrations** - Add Gmail (`/add-gmail`) and more via skills
-
-## Usage
-
-Talk to your assistant with the trigger word (default: `@Andy`):
-
-```
-@Andy send an overview of the sales pipeline every weekday morning at 9am (has access to my Obsidian vault folder)
-@Andy review the git history for the past week each Friday and update the README if there's drift
-@Andy every Monday at 8am, compile news on AI developments from Hacker News and TechCrunch and message me a briefing
-```
-
-From the main channel (your self-chat), you can manage groups and tasks:
-```
-@Andy list all scheduled tasks across groups
-@Andy pause the Monday briefing task
-@Andy join the Family Chat group
-```
-
-## Customizing
-
-There are no configuration files to learn. Just tell Claude Code what you want:
-
-- "Change the trigger word to @Bob"
-- "Remember in the future to make responses shorter and more direct"
-- "Add a custom greeting when I say good morning"
-- "Store conversation summaries weekly"
-
-Or run `/customize` for guided changes.
-
-The codebase is small enough that Claude can safely modify it.
-
-## Contributing
-
-**Don't add features. Add skills.**
-
-If you want to add Telegram support, don't create a PR that adds Telegram alongside WhatsApp. Instead, contribute a skill file (`.claude/skills/add-telegram/SKILL.md`) that teaches Claude Code how to transform a NanoClaw installation to use Telegram.
-
-Users then run `/add-telegram` on their fork and get clean code that does exactly what they need, not a bloated system trying to support every use case.
-
-### RFS (Request for Skills)
-
-Skills we'd love to see:
-
-**Communication Channels**
-- `/add-telegram` - Add Telegram as channel. Should give the user option to replace WhatsApp or add as additional channel. Also should be possible to add it as a control channel (where it can trigger actions) or just a channel that can be used in actions triggered elsewhere
-- `/add-slack` - Add Slack
-- `/add-discord` - Add Discord
-
-**Platform Support**
-- `/setup-windows` - Windows via WSL2 + Docker
-
-**Session Management**
-- `/add-clear` - Add a `/clear` command that compacts the conversation (summarizes context while preserving critical information in the same session). Requires figuring out how to trigger compaction programmatically via the Claude Agent SDK.
-
-## Requirements
-
-- macOS or Linux
-- Node.js 20+
-- [Claude Code](https://claude.ai/download)
-- [Apple Container](https://github.com/apple/container) (macOS) or [Docker](https://docker.com/products/docker-desktop) (macOS/Linux)
+**Requirements:** Node.js 20+, Docker, [Claude Code](https://claude.ai/download) (for API key)
 
 ## Architecture
 
 ```
-WhatsApp (baileys) --> SQLite --> Polling loop --> Container (Claude Agent SDK) --> Response
+WhatsApp (baileys) --> Guard filter --> SQLite --> Polling loop --> Docker (Claude Agent SDK) --> Response
 ```
 
-Single Node.js process. Agents execute in isolated Linux containers with mounted directories. IPC via filesystem. No daemons, no queues, no complexity.
+Single Node.js process. Moderation runs on the host for instant enforcement. Agent responses run in isolated Docker containers with mounted directories. Per-group message queues. IPC via filesystem.
 
 Key files:
-- `src/index.ts` - Main app: WhatsApp connection, routing, IPC
-- `src/container-runner.ts` - Spawns agent containers
-- `src/task-scheduler.ts` - Runs scheduled tasks
-- `src/db.ts` - SQLite operations
-- `groups/*/CLAUDE.md` - Per-group memory
+- `src/index.ts` — Main app: WhatsApp connection, message routing, IPC
+- `src/moderator.ts` — Guard evaluation, DM enforcement, admin caching
+- `src/guards/` — Guard implementations (content, property, behavioral, keyword)
+- `src/container-runner.ts` — Spawns streaming agent containers
+- `src/task-scheduler.ts` — Runs scheduled tasks
+- `src/db.ts` — SQLite operations (messages, moderation logs, groups, sessions)
+- `groups/*/CLAUDE.md` — Per-group memory
 
-## FAQ
+## Features
 
-**Why WhatsApp and not Telegram/Signal/etc?**
+- **14 moderation guards** — Content filtering, spam prevention, rate limiting, keyword blocking
+- **Observation mode** — Test rules without enforcing them
+- **WhatsApp I/O** — Message Claude from your phone, manage groups naturally
+- **Isolated group context** — Each group has its own memory, filesystem, and container sandbox
+- **Main channel** — Your private admin control channel with elevated privileges
+- **Scheduled tasks** — Recurring jobs that run Claude and can message you back
+- **Web access** — Search and fetch content
+- **Container isolation** — Agents sandboxed in Docker containers (macOS/Linux)
+- **Moderation logging** — Full audit trail in SQLite
 
-Because I use WhatsApp. Fork it and run a skill to change it. That's the whole point.
+## Usage
 
-**Why Apple Container instead of Docker?**
+Talk to your bot with the trigger word (default: `@GroupGuard`):
 
-On macOS, Apple Container is lightweight, fast, and optimized for Apple silicon. But Docker is also fully supported—during `/setup`, you can choose which runtime to use. On Linux, Docker is used automatically.
+```
+@GroupGuard enable no-spam for this group
+@GroupGuard show me the last 10 moderation violations
+@GroupGuard add a keyword filter blocking "crypto" and "forex"
+@GroupGuard schedule a daily summary of moderation activity at 9am
+```
 
-**Can I run this on Linux?**
+From the main channel, you have admin control over all groups:
+```
+@GroupGuard list all groups and their guard configs
+@GroupGuard enable observation mode for Work Team
+@GroupGuard show moderation stats across all groups
+```
 
-Yes. Run `/setup` and it will automatically configure Docker as the container runtime. Thanks to [@dotsetgreg](https://github.com/dotsetgreg) for contributing the `/convert-to-docker` skill.
+## Deploying to a Server
 
-**Is this secure?**
+GroupGuard needs Docker to spawn agent containers, which rules out most managed platforms — you need a real VM.
 
-Agents run in containers, not behind application-level permission checks. They can only access explicitly mounted directories. You should still review what you're running, but the codebase is small enough that you actually can. See [docs/SECURITY.md](docs/SECURITY.md) for the full security model.
+### Option 1: One-Click Deploy (exe.dev) — $20/month
 
-**Why no configuration files?**
+The fastest path. [exe.dev](https://exe.dev) gives you a VM with Docker pre-installed and an AI agent that sets everything up.
 
-We don't want configuration sprawl. Every user should customize it to so that the code matches exactly what they want rather than configuring a generic system. If you like having config files, tell Claude to add them.
+After the VM is provisioned (~5 min), authenticate WhatsApp:
 
-**How do I debug issues?**
+```bash
+ssh <vm-name>.exe.xyz
+cd /opt/groupguard && npm run auth   # scan QR code with your phone
+sudo systemctl start groupguard      # start the service
+```
 
-Ask Claude Code. "Why isn't the scheduler running?" "What's in the recent logs?" "Why did this message not get a response?" That's the AI-native approach.
+### Option 2: Budget VPS (Hetzner) — ~$4/month
 
-**Why isn't the setup working for me?**
+Best value. [Hetzner Cloud](https://www.hetzner.com/cloud/) with dedicated resources.
 
-I don't know. Run `claude`, then run `/debug`. If claude finds an issue that is likely affecting other users, open a PR to modify the setup SKILL.md.
+1. Create a server: **CX22** (2 vCPU, 4 GB RAM, 40 GB disk), Docker CE app image, Ubuntu 24.04
+2. SSH in and run:
 
-**What changes will be accepted into the codebase?**
+```bash
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+source ~/.bashrc && nvm install 22
 
-Security fixes, bug fixes, and clear improvements to the base configuration. That's it.
+git clone git@github.com:TomGranot/groupguard.git /opt/groupguard
+cd /opt/groupguard
+echo 'ANTHROPIC_API_KEY=your-key-here' > .env
+./setup.sh
 
-Everything else (new capabilities, OS compatibility, hardware support, enhancements) should be contributed as skills.
+npm run auth                          # scan QR code
+sudo systemctl start groupguard       # start the service
+```
 
-This keeps the base system minimal and lets every user customize their installation without inheriting features they don't want.
+### Other Options
+
+| Provider | Cost | Notes |
+|----------|------|-------|
+| **DigitalOcean** | $6-12/mo | Docker 1-Click image |
+| **Vultr** | $6-10/mo | Startup scripts |
+| **Linode/Akamai** | $5/mo+ | StackScripts |
+| **Oracle Cloud** | Free | ARM A1 (hard to provision) |
+| **Local macOS** | Free | Docker Desktop + launchd via `./setup.sh` |
+
+## Troubleshooting
+
+- **Docker not running** — macOS: start Docker Desktop. Linux: `sudo systemctl start docker`
+- **WhatsApp auth expired** — Run `npm run auth` to re-authenticate, then restart
+- **Service not starting** — Check `logs/nanoclaw.log` and `logs/nanoclaw.error.log`
+- **No response to messages** — Check the trigger pattern, verify the group is registered
+- **Guards not working** — Check moderation logs: `sqlite3 store/messages.db "SELECT * FROM moderation_log ORDER BY timestamp DESC LIMIT 10"`
+- **Container networking on macOS** — Docker Desktop handles this automatically. If using colima/lima, run `sudo ./scripts/macos-networking.sh`
+
+Run `/debug` in Claude Code for guided troubleshooting.
+
+## Customizing
+
+The codebase is small enough to modify safely. Tell Claude Code what you want:
+
+- "Add a new guard that blocks messages with more than 3 emojis"
+- "Change the DM message format when a message is blocked"
+- "Add a daily moderation report that gets sent to the admin group"
+
+Or run `/customize` for guided changes.
+
+## Based On
+
+GroupGuard is built on [NanoClaw](https://github.com/gavrielc/nanoclaw), a lightweight personal Claude assistant. NanoClaw provides the core architecture (WhatsApp connection, container isolation, scheduling, IPC) and GroupGuard adds the moderation layer on top.
 
 ## License
 
