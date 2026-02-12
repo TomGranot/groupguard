@@ -2,9 +2,12 @@
  * WhatsApp Authentication Script
  *
  * Run this during setup to authenticate with WhatsApp.
- * Displays QR code, waits for scan, saves credentials, then exits.
+ * Uses pairing code by default (enter code on your phone).
+ * Pass --qr flag to use QR code scanning instead.
  *
- * Usage: npx tsx src/whatsapp-auth.ts
+ * Usage:
+ *   npx tsx src/whatsapp-auth.ts              # pairing code (default)
+ *   npx tsx src/whatsapp-auth.ts --qr         # QR code
  */
 
 import makeWASocket, {
@@ -15,13 +18,27 @@ import makeWASocket, {
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 import fs from 'fs';
-import path from 'path';
+import readline from 'readline';
 
 const AUTH_DIR = './store/auth';
+const useQR = process.argv.includes('--qr');
 
 const logger = pino({
-  level: 'warn', // Quiet logging - only show errors
+  level: 'warn',
 });
+
+function askQuestion(question: string): Promise<string> {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
 
 async function authenticate(): Promise<void> {
   fs.mkdirSync(AUTH_DIR, { recursive: true });
@@ -43,13 +60,44 @@ async function authenticate(): Promise<void> {
     },
     printQRInTerminal: false,
     logger,
-    browser: ['NanoClaw', 'Chrome', '1.0.0'],
+    browser: ['GroupGuard', 'Chrome', '1.0.0'],
   });
+
+  // Request pairing code if not using QR mode
+  if (!useQR && !state.creds.registered) {
+    const phoneNumber = await askQuestion(
+      'Enter your phone number (with country code, no + or spaces, e.g. 14155551234): ',
+    );
+
+    if (!/^\d{7,15}$/.test(phoneNumber)) {
+      console.error('✗ Invalid phone number. Use digits only with country code (e.g. 14155551234)');
+      process.exit(1);
+    }
+
+    // Small delay to let the socket connect before requesting pairing code
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+
+    try {
+      const code = await sock.requestPairingCode(phoneNumber);
+      console.log(`\nYour pairing code: ${code}\n`);
+      console.log('On your phone:');
+      console.log('  1. Open WhatsApp');
+      console.log('  2. Tap Settings → Linked Devices → Link a Device');
+      console.log(`  3. Tap "Link with phone number instead"`);
+      console.log(`  4. Enter the code: ${code}\n`);
+      console.log('Waiting for confirmation...');
+    } catch (err) {
+      console.error('✗ Failed to request pairing code:', (err as Error).message);
+      console.log('  Try again, or use --qr flag for QR code authentication.');
+      process.exit(1);
+    }
+  }
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    if (qr) {
+    // Only show QR code in QR mode
+    if (qr && useQR) {
       console.log('Scan this QR code with WhatsApp:\n');
       console.log('  1. Open WhatsApp on your phone');
       console.log('  2. Tap Settings → Linked Devices → Link a Device');
@@ -72,9 +120,8 @@ async function authenticate(): Promise<void> {
     if (connection === 'open') {
       console.log('\n✓ Successfully authenticated with WhatsApp!');
       console.log('  Credentials saved to store/auth/');
-      console.log('  You can now start the NanoClaw service.\n');
+      console.log('  You can now start GroupGuard.\n');
 
-      // Give it a moment to save credentials, then exit
       setTimeout(() => process.exit(0), 1000);
     }
   });
