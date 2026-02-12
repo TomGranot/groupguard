@@ -83,22 +83,32 @@ function getRuntimeType(): ContainerRuntime {
 }
 
 /**
- * Read secrets from .env file. Returns only allowed auth variables.
+ * Read secrets from .env file and process environment.
+ * .env file values take precedence over environment variables.
+ * Supports both API key (ANTHROPIC_API_KEY) and Claude Code subscription (CLAUDE_CODE_OAUTH_TOKEN).
  * These are passed via stdin JSON to the container, never written to disk.
  */
 function readSecrets(): Record<string, string> {
-  const envFile = path.join(process.cwd(), '.env');
   const secrets: Record<string, string> = {};
 
-  if (!fs.existsSync(envFile)) return secrets;
+  // First, check process environment (covers Claude Code subscription tokens)
+  for (const varName of SECRET_VAR_NAMES) {
+    if (process.env[varName]) {
+      secrets[varName] = process.env[varName]!;
+    }
+  }
 
-  const envContent = fs.readFileSync(envFile, 'utf-8');
-  for (const line of envContent.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    for (const varName of SECRET_VAR_NAMES) {
-      if (trimmed.startsWith(`${varName}=`)) {
-        secrets[varName] = trimmed.slice(varName.length + 1);
+  // Then, override with .env file values if present
+  const envFile = path.join(process.cwd(), '.env');
+  if (fs.existsSync(envFile)) {
+    const envContent = fs.readFileSync(envFile, 'utf-8');
+    for (const line of envContent.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      for (const varName of SECRET_VAR_NAMES) {
+        if (trimmed.startsWith(`${varName}=`)) {
+          secrets[varName] = trimmed.slice(varName.length + 1);
+        }
       }
     }
   }
