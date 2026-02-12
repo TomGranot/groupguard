@@ -15,12 +15,12 @@ import {
   STORE_DIR,
   DATA_DIR,
   TRIGGER_PATTERN,
-  MAIN_GROUP_FOLDER,
   IPC_POLL_INTERVAL,
-  TIMEZONE
+  TIMEZONE,
+  MAIN_GROUP_FOLDER
 } from './config.js';
 import { RegisteredGroup, Session, NewMessage } from './types.js';
-import { initDatabase, storeMessage, storeChatMetadata, getNewMessages, getMessagesSince, getAllTasks, getTaskById, updateChatName, getAllChats, getLastGroupSync, setLastGroupSync } from './db.js';
+import { initDatabase, storeMessage, storeChatMetadata, getNewMessages, getMessagesSince, getAllTasks, getTaskById, updateChatName, getAllChats, getLastGroupSync, setLastGroupSync, getModerationStats, getModerationLogs } from './db.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot, AvailableGroup } from './container-runner.js';
 import { loadJson, saveJson } from './utils.js';
@@ -134,10 +134,10 @@ async function processMessage(msg: NewMessage): Promise<void> {
   if (!group) return;
 
   const content = msg.content.trim();
-  const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
+  const isMain = group.folder === MAIN_GROUP_FOLDER;
 
   // Main group responds to all messages; other groups require trigger prefix
-  if (!isMainGroup && !TRIGGER_PATTERN.test(content)) return;
+  if (!isMain && !TRIGGER_PATTERN.test(content)) return;
 
   // Get all messages since last agent interaction so the session has full context
   const sinceTimestamp = lastAgentTimestamp[msg.chat_jid] || '';
@@ -176,21 +176,26 @@ async function runAgent(group: RegisteredGroup, prompt: string, chatJid: string)
   const isMain = group.folder === MAIN_GROUP_FOLDER;
   const sessionId = sessions[group.folder];
 
-  // Update tasks snapshot for container to read (filtered by group)
+  // Update tasks snapshot for container to read
   const tasks = getAllTasks();
-  writeTasksSnapshot(group.folder, isMain, tasks.map(t => ({
-    id: t.id,
-    groupFolder: t.group_folder,
-    prompt: t.prompt,
-    schedule_type: t.schedule_type,
-    schedule_value: t.schedule_value,
-    status: t.status,
-    next_run: t.next_run
-  })));
+  writeTasksSnapshot(
+    group.folder,
+    isMain,
+    tasks.map(t => ({
+      id: t.id,
+      groupFolder: t.group_folder,
+      prompt: t.prompt,
+      schedule_type: t.schedule_type,
+      schedule_value: t.schedule_value,
+      status: t.status,
+      next_run: t.next_run
+    })),
+  );
 
-  // Update available groups snapshot (main group only can see all groups)
+  // Update available groups snapshot (main group can see all WhatsApp groups)
   const availableGroups = getAvailableGroups();
-  writeGroupsSnapshot(group.folder, isMain, availableGroups, new Set(Object.keys(registeredGroups)));
+  const registeredJids = new Set(Object.keys(registeredGroups));
+  writeGroupsSnapshot(group.folder, isMain, availableGroups, registeredJids);
 
   try {
     const output = await runContainerAgent(group, {
@@ -198,7 +203,7 @@ async function runAgent(group: RegisteredGroup, prompt: string, chatJid: string)
       sessionId,
       groupFolder: group.folder,
       chatJid,
-      isMain
+      isMain,
     });
 
     if (output.newSessionId) {
@@ -259,7 +264,7 @@ function startIpcWatcher(): void {
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
               if (data.type === 'message' && data.chatJid && data.text) {
-                // Authorization: verify this group can send to this chatJid
+                // Authorization: main group can send anywhere, others only to their own chat
                 const targetGroup = registeredGroups[data.chatJid];
                 if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
                   await sendMessage(data.chatJid, `${ASSISTANT_NAME}: ${data.text}`);
@@ -289,7 +294,7 @@ function startIpcWatcher(): void {
             const filePath = path.join(tasksDir, file);
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              // Pass source group identity to processTaskIpc for authorization
+              // Pass source group identity for authorization
               await processTaskIpc(data, sourceGroup, isMain);
               fs.unlinkSync(filePath);
             } catch (err) {
@@ -331,24 +336,24 @@ async function processTaskIpc(
     guards?: RegisteredGroup['guards'];
     moderationConfig?: RegisteredGroup['moderationConfig'];
   },
-  sourceGroup: string,  // Verified identity from IPC directory
-  isMain: boolean       // Verified from directory path
+  sourceGroup: string,
+  isMain: boolean,
 ): Promise<void> {
-  // Import db functions dynamically to avoid circular deps
   const { createTask, updateTask, deleteTask, getTaskById: getTask } = await import('./db.js');
   const { CronExpressionParser } = await import('cron-parser');
 
   switch (data.type) {
     case 'schedule_task':
       if (data.prompt && data.schedule_type && data.schedule_value && data.groupFolder) {
-        // Authorization: non-main groups can only schedule for themselves
         const targetGroup = data.groupFolder;
+
+        // Authorization: non-main groups can only schedule for themselves
         if (!isMain && targetGroup !== sourceGroup) {
           logger.warn({ sourceGroup, targetGroup }, 'Unauthorized schedule_task attempt blocked');
           break;
         }
 
-        // Resolve the correct JID for the target group (don't trust IPC payload)
+        // Resolve the correct JID for the target group
         const targetJid = Object.entries(registeredGroups).find(
           ([, group]) => group.folder === targetGroup
         )?.[0];
@@ -448,8 +453,9 @@ async function processTaskIpc(
         await syncGroupMetadata(true);
         // Write updated snapshot immediately
         const availableGroups = getAvailableGroups();
+        const registeredJids = new Set(Object.keys(registeredGroups));
         const { writeGroupsSnapshot: writeGroups } = await import('./container-runner.js');
-        writeGroups(sourceGroup, true, availableGroups, new Set(Object.keys(registeredGroups)));
+        writeGroups(sourceGroup, true, availableGroups, registeredJids);
       } else {
         logger.warn({ sourceGroup }, 'Unauthorized refresh_groups attempt blocked');
       }
@@ -467,7 +473,7 @@ async function processTaskIpc(
           folder: data.folder,
           trigger: data.trigger,
           added_at: new Date().toISOString(),
-          containerConfig: data.containerConfig
+          containerConfig: data.containerConfig,
         });
       } else {
         logger.warn({ data }, 'Invalid register_group request - missing required fields');
@@ -519,7 +525,7 @@ async function connectWhatsApp(): Promise<void> {
     if (qr) {
       const msg = 'WhatsApp authentication required. Run /setup in Claude Code.';
       logger.error(msg);
-      exec(`osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`);
+      exec(`osascript -e 'display notification "${msg}" with title "GroupGuard" sound name "Basso"'`);
       setTimeout(() => process.exit(1), 1000);
     }
 
@@ -582,12 +588,12 @@ async function connectWhatsApp(): Promise<void> {
       // Always store chat metadata for group discovery
       storeChatMetadata(chatJid, timestamp);
 
-      // Only process full message content for registered groups
+      // Process messages for registered groups
       if (registeredGroups[chatJid]) {
         const group = registeredGroups[chatJid];
 
         // Run moderation guards BEFORE storing the message
-        if (group.guards && group.guards.length > 0) {
+        if (group?.guards && group.guards.length > 0 && chatJid.endsWith('@g.us')) {
           const blocked = await moderateMessage(
             msg,
             chatJid,
@@ -618,8 +624,8 @@ async function startMessageLoop(): Promise<void> {
 
   while (true) {
     try {
-      const jids = Object.keys(registeredGroups);
-      const { messages } = getNewMessages(jids, lastTimestamp, ASSISTANT_NAME);
+      const registeredJids = Object.keys(registeredGroups);
+      const { messages } = getNewMessages(registeredJids, lastTimestamp, ASSISTANT_NAME);
 
       if (messages.length > 0) logger.info({ count: messages.length }, 'New messages');
       for (const msg of messages) {
@@ -641,30 +647,31 @@ async function startMessageLoop(): Promise<void> {
   }
 }
 
-function ensureDockerRunning(): void {
+function ensureRuntimeRunning(): void {
+  const runtime = detectRuntime();
   try {
-    execSync('docker info', { stdio: 'pipe', timeout: 10000 });
-    logger.debug('Docker is running');
+    execSync(`${runtime} info`, { stdio: 'pipe', timeout: 10000 });
+    logger.debug({ runtime }, 'Container runtime is running');
   } catch {
     console.error('\n╔════════════════════════════════════════════════════════╗');
-    console.error('║  FATAL: Docker is not running                          ║');
+    console.error('║  FATAL: Container runtime is not running               ║');
     console.error('║                                                        ║');
-    console.error('║  Agents cannot run without Docker. To fix:             ║');
-    console.error('║  • macOS: Start Docker Desktop                         ║');
+    console.error('║  Agents cannot run without a container runtime.        ║');
+    console.error('║  • macOS: Start Docker Desktop or use Apple Containers ║');
     console.error('║  • Linux: sudo systemctl start docker                  ║');
     console.error('╚════════════════════════════════════════════════════════╝\n');
-    throw new Error('Docker is required but not running');
+    throw new Error('Container runtime is required but not running');
   }
 
   // Kill and clean up orphaned containers from previous runs
   try {
     const output = execSync(
-      'docker ps --filter "name=nanoclaw-" --format "{{.Names}}"',
+      `${runtime} ps --filter "name=nanoclaw-" --format "{{.Names}}"`,
       { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
     );
     const orphans = output.trim().split('\n').filter(Boolean);
     for (const name of orphans) {
-      try { execSync(`docker stop ${name}`, { stdio: 'pipe' }); } catch { /* already stopped */ }
+      try { execSync(`${runtime} stop ${name}`, { stdio: 'pipe' }); } catch { /* already stopped */ }
     }
     if (orphans.length > 0) {
       logger.info({ count: orphans.length, names: orphans }, 'Stopped orphaned containers');
@@ -674,8 +681,11 @@ function ensureDockerRunning(): void {
   }
 }
 
+// Re-export detectRuntime from container-runner for use in startup
+import { detectRuntime } from './container-runner.js';
+
 async function main(): Promise<void> {
-  ensureDockerRunning();
+  ensureRuntimeRunning();
   initDatabase();
   logger.info('Database initialized');
   loadState();
@@ -683,6 +693,6 @@ async function main(): Promise<void> {
 }
 
 main().catch(err => {
-  logger.error({ err }, 'Failed to start NanoClaw');
+  logger.error({ err }, 'Failed to start GroupGuard');
   process.exit(1);
 });

@@ -1,9 +1,9 @@
 #!/bin/bash
-# GroupGuard / NanoClaw One-Command Setup
+# GroupGuard One-Command Setup
 #
 # Usage: ./setup.sh
 #
-# Prerequisites: Node.js 20+, Docker
+# Prerequisites: Node.js 20+, Docker or Apple Containers (macOS 26+)
 
 set -e
 
@@ -35,16 +35,52 @@ if [[ "$NODE_VERSION" -lt 20 ]]; then
 fi
 ok "Node.js $(node -v)"
 
-# --- Step 2: Check Docker ---
-echo "Step 2: Checking Docker..."
-if ! command -v docker &>/dev/null; then
-  fail "Docker not found. Install from https://docker.com/products/docker-desktop"
-fi
+# --- Step 2: Check container runtime ---
+echo "Step 2: Checking container runtime..."
 
-if ! docker info &>/dev/null; then
-  fail "Docker is not running. Start Docker Desktop (macOS) or run 'sudo systemctl start docker' (Linux)"
+OS="$(uname -s)"
+RUNTIME=""
+
+if [[ "$OS" == "Darwin" ]]; then
+  # macOS: prefer Apple Containers, fall back to Docker
+  if command -v container &>/dev/null; then
+    RUNTIME="container"
+    ok "Apple Containers (macOS)"
+
+    # Set up networking for Apple Containers
+    if [[ -f "$PROJECT_ROOT/scripts/macos-networking.sh" ]]; then
+      echo "  Setting up Apple Container networking..."
+      if sudo "$PROJECT_ROOT/scripts/macos-networking.sh" --non-interactive 2>/dev/null; then
+        ok "Networking configured"
+      else
+        warn "Networking setup may need manual steps. Run: sudo ./scripts/macos-networking.sh"
+      fi
+    fi
+  elif command -v docker &>/dev/null; then
+    RUNTIME="docker"
+    if ! docker info &>/dev/null; then
+      fail "Docker is not running. Start Docker Desktop or run: sudo systemctl start docker"
+    fi
+    ok "Docker $(docker --version | awk '{print $3}' | tr -d ',')"
+
+    # Check if non-Desktop Docker needs networking
+    if ! docker info 2>/dev/null | grep -q "Desktop"; then
+      warn "Non-Desktop Docker detected. You may need to run: sudo ./scripts/macos-networking.sh"
+    fi
+  else
+    fail "No container runtime found. Install Docker Desktop from https://docker.com or use Apple Containers on macOS 26+"
+  fi
+else
+  # Linux/other: Docker only
+  if ! command -v docker &>/dev/null; then
+    fail "Docker not found. Install from https://docker.com"
+  fi
+  if ! docker info &>/dev/null; then
+    fail "Docker is not running. Run: sudo systemctl start docker"
+  fi
+  RUNTIME="docker"
+  ok "Docker $(docker --version | awk '{print $3}' | tr -d ',')"
 fi
-ok "Docker $(docker --version | awk '{print $3}' | tr -d ',')"
 
 # --- Step 3: Install dependencies ---
 echo "Step 3: Installing dependencies..."
@@ -53,8 +89,8 @@ ok "npm packages installed"
 
 # --- Step 4: Build container image ---
 echo "Step 4: Building container image..."
-./container/build.sh
-if docker run --rm --entrypoint echo nanoclaw-agent:latest "OK" &>/dev/null; then
+CONTAINER_RUNTIME="$( [[ "$RUNTIME" == "container" ]] && echo "apple" || echo "docker" )" ./container/build.sh
+if $RUNTIME run --rm --entrypoint echo nanoclaw-agent:latest "OK" &>/dev/null; then
   ok "Container image built and verified"
 else
   fail "Container image build failed"
@@ -82,7 +118,6 @@ ok "TypeScript compiled"
 # --- Step 7: Install service ---
 echo "Step 7: Installing service..."
 
-OS="$(uname -s)"
 case "$OS" in
   Darwin)
     echo "  Detected: macOS"
@@ -90,6 +125,13 @@ case "$OS" in
     # Generate launchd plist
     NODE_PATH=$(which node)
     HOME_PATH="$HOME"
+
+    # Set CONTAINER_RUNTIME env var so the service uses the right runtime
+    RUNTIME_ENV=""
+    if [[ "$RUNTIME" == "container" ]]; then
+      RUNTIME_ENV="        <key>CONTAINER_RUNTIME</key>
+        <string>apple</string>"
+    fi
 
     cat > ~/Library/LaunchAgents/com.nanoclaw.plist << EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -115,6 +157,7 @@ case "$OS" in
         <string>/usr/local/bin:/usr/bin:/bin:${HOME_PATH}/.local/bin</string>
         <key>HOME</key>
         <string>${HOME_PATH}</string>
+${RUNTIME_ENV}
     </dict>
     <key>StandardOutPath</key>
     <string>${PROJECT_ROOT}/logs/nanoclaw.log</string>
@@ -127,11 +170,6 @@ EOF
     mkdir -p logs
     launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist 2>/dev/null || true
     ok "launchd service installed and started"
-
-    # Check if Docker Desktop handles networking
-    if ! docker info 2>/dev/null | grep -q "Desktop"; then
-      warn "Non-Desktop Docker detected. You may need to run: sudo ./scripts/macos-networking.sh"
-    fi
     ;;
 
   Linux)
@@ -162,6 +200,7 @@ echo ""
 echo "=== Setup Complete ==="
 echo ""
 echo "Your assistant is running! Send a message in WhatsApp to test."
+echo "Runtime: ${RUNTIME}"
 echo ""
 echo "Useful commands:"
 echo "  npm run dev      - Run in development mode (with hot reload)"

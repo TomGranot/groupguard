@@ -1,11 +1,11 @@
 /**
- * NanoClaw Agent Runner
+ * GroupGuard Agent Runner
  * Runs inside a container, receives config via stdin, outputs result to stdout
  */
 
 import fs from 'fs';
 import path from 'path';
-import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+import { query, HookCallback, PreCompactHookInput, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { createIpcMcp } from './ipc-mcp.js';
 
 interface ContainerInput {
@@ -15,6 +15,7 @@ interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  secrets?: Record<string, string>;
 }
 
 interface ContainerOutput {
@@ -56,6 +57,42 @@ function writeOutput(output: ContainerOutput): void {
 
 function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
+}
+
+// Env vars to strip from all Bash subprocesses — prevents agent from reading API keys
+const SANITIZED_VARS = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'];
+
+/**
+ * PreToolUse hook that sanitizes secret env vars from every Bash command.
+ * Prepends `unset VAR1 VAR2 2>/dev/null;` to the command so even `env`,
+ * `echo $VAR`, or `cat /proc/self/environ` won't reveal secrets.
+ */
+function createSanitizeBashHook(): HookCallback {
+  const unsetPrefix = `unset ${SANITIZED_VARS.join(' ')} 2>/dev/null; `;
+
+  return async (input, _toolUseId, _context) => {
+    const preToolUse = input as PreToolUseHookInput;
+
+    if (preToolUse.tool_name !== 'Bash') {
+      return {};
+    }
+
+    const toolInput = preToolUse.tool_input as { command?: string } | undefined;
+    if (!toolInput?.command) {
+      return {};
+    }
+
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse' as const,
+        permissionDecision: 'allow' as const,
+        updatedInput: {
+          ...toolInput,
+          command: unsetPrefix + toolInput.command
+        }
+      }
+    };
+  };
 }
 
 function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
@@ -207,6 +244,16 @@ async function main(): Promise<void> {
     const stdinData = await readStdin();
     input = JSON.parse(stdinData);
     log(`Received input for group: ${input.groupFolder}`);
+
+    // Set secrets in process memory (SDK needs them for auth)
+    // They stay in Node.js process.env but are stripped from Bash subprocesses by the hook
+    if (input.secrets) {
+      for (const [key, value] of Object.entries(input.secrets)) {
+        process.env[key] = value;
+      }
+      delete input.secrets; // Don't keep secrets in the input object
+      log('Secrets loaded into process environment');
+    }
   } catch (err) {
     writeOutput({
       status: 'error',
@@ -219,7 +266,7 @@ async function main(): Promise<void> {
   const ipcMcp = createIpcMcp({
     chatJid: input.chatJid,
     groupFolder: input.groupFolder,
-    isMain: input.isMain
+    isMain: input.isMain,
   });
 
   let result: string | null = null;
@@ -252,6 +299,7 @@ async function main(): Promise<void> {
           nanoclaw: ipcMcp
         },
         hooks: {
+          PreToolUse: [{ hooks: [createSanitizeBashHook()] }],
           PreCompact: [{ hooks: [createPreCompactHook()] }]
         }
       }

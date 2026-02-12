@@ -1,9 +1,9 @@
 /**
- * Container Runner for NanoClaw
- * Spawns agent execution in Docker and handles IPC
+ * Container Runner for GroupGuard
+ * Spawns agent execution in Docker or Apple Containers and handles IPC
  */
 
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -13,7 +13,8 @@ import {
   CONTAINER_TIMEOUT,
   CONTAINER_MAX_OUTPUT_SIZE,
   GROUPS_DIR,
-  DATA_DIR
+  DATA_DIR,
+  MAIN_GROUP_FOLDER
 } from './config.js';
 import { RegisteredGroup } from './types.js';
 import { validateAdditionalMounts } from './mount-security.js';
@@ -26,6 +27,84 @@ const logger = pino({
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+
+// Secret env vars that should never appear in logs or container filesystems
+const SECRET_VAR_NAMES = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'];
+
+// --- Runtime Detection ---
+
+type ContainerRuntime = 'docker' | 'apple';
+
+let cachedRuntime: ContainerRuntime | null = null;
+
+/**
+ * Detect which container runtime to use.
+ * Checks CONTAINER_RUNTIME env var first, then auto-detects.
+ * On macOS: prefers Apple Containers (`container` CLI) if available, falls back to Docker.
+ * On Linux/Windows: always Docker.
+ */
+export function detectRuntime(): string {
+  if (cachedRuntime) {
+    return cachedRuntime === 'apple' ? 'container' : 'docker';
+  }
+
+  const envRuntime = process.env.CONTAINER_RUNTIME?.toLowerCase();
+
+  if (envRuntime === 'apple') {
+    cachedRuntime = 'apple';
+    return 'container';
+  }
+
+  if (envRuntime === 'docker') {
+    cachedRuntime = 'docker';
+    return 'docker';
+  }
+
+  // Auto-detect
+  if (os.platform() === 'darwin') {
+    try {
+      execSync('which container', { stdio: 'pipe' });
+      cachedRuntime = 'apple';
+      logger.info('Detected Apple Containers runtime');
+      return 'container';
+    } catch {
+      // Apple Containers not available, fall through to Docker
+    }
+  }
+
+  cachedRuntime = 'docker';
+  logger.info('Using Docker runtime');
+  return 'docker';
+}
+
+function getRuntimeType(): ContainerRuntime {
+  if (!cachedRuntime) detectRuntime();
+  return cachedRuntime!;
+}
+
+/**
+ * Read secrets from .env file. Returns only allowed auth variables.
+ * These are passed via stdin JSON to the container, never written to disk.
+ */
+function readSecrets(): Record<string, string> {
+  const envFile = path.join(process.cwd(), '.env');
+  const secrets: Record<string, string> = {};
+
+  if (!fs.existsSync(envFile)) return secrets;
+
+  const envContent = fs.readFileSync(envFile, 'utf-8');
+  for (const line of envContent.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    for (const varName of SECRET_VAR_NAMES) {
+      if (trimmed.startsWith(`${varName}=`)) {
+        secrets[varName] = trimmed.slice(varName.length + 1);
+      }
+    }
+  }
+
+  return secrets;
+}
 
 function getHomeDir(): string {
   const home = process.env.HOME || os.homedir();
@@ -42,6 +121,7 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  secrets?: Record<string, string>;
 }
 
 export interface ContainerOutput {
@@ -59,31 +139,24 @@ interface VolumeMount {
 
 function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount[] {
   const mounts: VolumeMount[] = [];
-  const homeDir = getHomeDir();
-  const projectRoot = process.cwd();
 
   if (isMain) {
     // Main gets the entire project root mounted
     mounts.push({
-      hostPath: projectRoot,
+      hostPath: process.cwd(),
       containerPath: '/workspace/project',
       readonly: false
     });
+  }
 
-    // Main also gets its group folder as the working directory
-    mounts.push({
-      hostPath: path.join(GROUPS_DIR, group.folder),
-      containerPath: '/workspace/group',
-      readonly: false
-    });
-  } else {
-    // Other groups only get their own folder
-    mounts.push({
-      hostPath: path.join(GROUPS_DIR, group.folder),
-      containerPath: '/workspace/group',
-      readonly: false
-    });
+  // Group's own folder
+  mounts.push({
+    hostPath: path.join(GROUPS_DIR, group.folder),
+    containerPath: '/workspace/group',
+    readonly: false
+  });
 
+  if (!isMain) {
     // Global memory directory (read-only for non-main)
     const globalDir = path.join(GROUPS_DIR, 'global');
     if (fs.existsSync(globalDir)) {
@@ -96,51 +169,26 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
   }
 
   // Per-group Claude sessions directory (isolated from other groups)
-  // Each group gets their own .claude/ to prevent cross-group session access
-  const groupSessionsDir = path.join(DATA_DIR, 'sessions', group.folder, '.claude');
-  fs.mkdirSync(groupSessionsDir, { recursive: true });
+  const sessionsPath = path.join(DATA_DIR, 'sessions', group.folder, '.claude');
+  fs.mkdirSync(sessionsPath, { recursive: true });
   mounts.push({
-    hostPath: groupSessionsDir,
+    hostPath: sessionsPath,
     containerPath: '/home/node/.claude',
     readonly: false
   });
 
-  // Per-group IPC namespace: each group gets its own IPC directory
-  // This prevents cross-group privilege escalation via IPC
-  const groupIpcDir = path.join(DATA_DIR, 'ipc', group.folder);
-  fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
+  // Per-group IPC namespace
+  const ipcPath = path.join(DATA_DIR, 'ipc', group.folder);
+  fs.mkdirSync(path.join(ipcPath, 'messages'), { recursive: true });
+  fs.mkdirSync(path.join(ipcPath, 'tasks'), { recursive: true });
   mounts.push({
-    hostPath: groupIpcDir,
+    hostPath: ipcPath,
     containerPath: '/workspace/ipc',
     readonly: false
   });
 
-  // Environment file directory
-  // Only expose specific auth variables needed by Claude Code, not the entire .env
-  const envDir = path.join(DATA_DIR, 'env');
-  fs.mkdirSync(envDir, { recursive: true });
-  const envFile = path.join(projectRoot, '.env');
-  if (fs.existsSync(envFile)) {
-    const envContent = fs.readFileSync(envFile, 'utf-8');
-    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
-    const filteredLines = envContent
-      .split('\n')
-      .filter(line => {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) return false;
-        return allowedVars.some(v => trimmed.startsWith(`${v}=`));
-      });
-
-    if (filteredLines.length > 0) {
-      fs.writeFileSync(path.join(envDir, 'env'), filteredLines.join('\n') + '\n');
-      mounts.push({
-        hostPath: envDir,
-        containerPath: '/workspace/env-dir',
-        readonly: true
-      });
-    }
-  }
+  // NOTE: Secrets (API keys) are passed via stdin JSON, not mounted as files.
+  // This prevents agents from reading them via `cat`, `env`, or `/proc/self/environ`.
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
@@ -156,7 +204,28 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
 }
 
 function buildContainerArgs(mounts: VolumeMount[]): string[] {
-  const args: string[] = ['run', '-i', '--rm', '-e', 'NODE_OPTIONS=--dns-result-order=ipv4first'];
+  const runtime = getRuntimeType();
+  const args: string[] = [
+    'run', '-i', '--rm',
+    '-e', 'NODE_OPTIONS=--dns-result-order=ipv4first',
+  ];
+
+  if (runtime === 'docker') {
+    // Docker-specific security hardening flags
+    args.push(
+      '--security-opt', 'no-new-privileges',
+      '--memory=512m',
+      '--cpus=1',
+      '--read-only',
+      '--tmpfs', '/tmp:rw,noexec,nosuid,size=256m',
+    );
+  } else {
+    // Apple Containers — different flag syntax
+    args.push(
+      '--memory=512m',
+      '--cpus=1',
+    );
+  }
 
   for (const mount of mounts) {
     if (mount.readonly) {
@@ -176,6 +245,7 @@ export async function runContainerAgent(
   input: ContainerInput
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
+  const runtime = detectRuntime();
 
   const groupDir = path.join(GROUPS_DIR, group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
@@ -185,6 +255,7 @@ export async function runContainerAgent(
 
   logger.debug({
     group: group.name,
+    runtime,
     mounts: mounts.map(m => `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`),
     containerArgs: containerArgs.join(' ')
   }, 'Container mount configuration');
@@ -192,14 +263,19 @@ export async function runContainerAgent(
   logger.info({
     group: group.name,
     mountCount: mounts.length,
-    isMain: input.isMain
+    isMain: input.isMain,
+    runtime
   }, 'Spawning container agent');
+
+  // Inject secrets into stdin payload (never written to disk or passed as env vars)
+  const secrets = readSecrets();
+  const stdinPayload = { ...input, secrets };
 
   const logsDir = path.join(GROUPS_DIR, group.folder, 'logs');
   fs.mkdirSync(logsDir, { recursive: true });
 
   return new Promise((resolve) => {
-    const container = spawn('docker', containerArgs, {
+    const container = spawn(runtime, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe']
     });
 
@@ -208,7 +284,7 @@ export async function runContainerAgent(
     let stdoutTruncated = false;
     let stderrTruncated = false;
 
-    container.stdin.write(JSON.stringify(input));
+    container.stdin.write(JSON.stringify(stdinPayload));
     container.stdin.end();
 
     container.stdout.on('data', (data) => {
@@ -263,6 +339,7 @@ export async function runContainerAgent(
         `=== Container Run Log ===`,
         `Timestamp: ${new Date().toISOString()}`,
         `Group: ${group.name}`,
+        `Runtime: ${runtime}`,
         `IsMain: ${input.isMain}`,
         `Duration: ${duration}ms`,
         `Exit Code: ${code}`,
@@ -272,9 +349,11 @@ export async function runContainerAgent(
       ];
 
       if (isVerbose) {
+        // Strip secrets from logged input
+        const { secrets: _secrets, ...safeInput } = stdinPayload;
         logLines.push(
           `=== Input ===`,
-          JSON.stringify(input, null, 2),
+          JSON.stringify(safeInput, null, 2),
           ``,
           `=== Container Args ===`,
           containerArgs.join(' '),
@@ -390,7 +469,7 @@ export function writeTasksSnapshot(
     schedule_value: string;
     status: string;
     next_run: string | null;
-  }>
+  }>,
 ): void {
   // Write filtered tasks to the group's IPC directory
   const groupIpcDir = path.join(DATA_DIR, 'ipc', groupFolder);
@@ -414,19 +493,19 @@ export interface AvailableGroup {
 
 /**
  * Write available groups snapshot for the container to read.
- * Only main group can see all available groups (for activation).
- * Non-main groups only see their own registration status.
+ * Only main group can see all available groups (for registration).
+ * Non-main groups see nothing (they can't register groups).
  */
 export function writeGroupsSnapshot(
   groupFolder: string,
   isMain: boolean,
   groups: AvailableGroup[],
-  registeredJids: Set<string>
+  registeredJids: Set<string>,
 ): void {
   const groupIpcDir = path.join(DATA_DIR, 'ipc', groupFolder);
   fs.mkdirSync(groupIpcDir, { recursive: true });
 
-  // Main sees all groups; others see nothing (they can't activate groups)
+  // Main sees all groups; others see nothing
   const visibleGroups = isMain ? groups : [];
 
   const groupsFile = path.join(groupIpcDir, 'available_groups.json');

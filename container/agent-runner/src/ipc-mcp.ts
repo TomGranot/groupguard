@@ -1,5 +1,5 @@
 /**
- * IPC-based MCP Server for NanoClaw
+ * IPC-based MCP Server for GroupGuard
  * Writes messages and tasks to files for the host process to pick up
  */
 
@@ -71,25 +71,25 @@ export function createIpcMcp(ctx: IpcMcpContext) {
         `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools.
 
 CONTEXT MODE - Choose based on task type:
-• "group" (recommended for most tasks): Task runs in the group's conversation context, with access to chat history and memory. Use for tasks that need context about ongoing discussions, user preferences, or previous interactions.
-• "isolated": Task runs in a fresh session with no conversation history. Use for independent tasks that don't need prior context. When using isolated mode, include all necessary context in the prompt itself.
+- "group" (recommended for most tasks): Task runs in the group's conversation context, with access to chat history and memory. Use for tasks that need context about ongoing discussions, user preferences, or previous interactions.
+- "isolated": Task runs in a fresh session with no conversation history. Use for independent tasks that don't need prior context. When using isolated mode, include all necessary context in the prompt itself.
 
 If unsure which mode to use, ask the user. Examples:
-- "Remind me about our discussion" → group (needs conversation context)
-- "Check the weather every morning" → isolated (self-contained task)
-- "Follow up on my request" → group (needs to know what was requested)
-- "Generate a daily report" → isolated (just needs instructions in prompt)
+- "Remind me about our discussion" -> group (needs conversation context)
+- "Check the weather every morning" -> isolated (self-contained task)
+- "Follow up on my request" -> group (needs to know what was requested)
+- "Generate a daily report" -> isolated (just needs instructions in prompt)
 
 SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
-• cron: Standard cron expression (e.g., "*/5 * * * *" for every 5 minutes, "0 9 * * *" for daily at 9am LOCAL time)
-• interval: Milliseconds between runs (e.g., "300000" for 5 minutes, "3600000" for 1 hour)
-• once: Local time WITHOUT "Z" suffix (e.g., "2026-02-01T15:30:00"). Do NOT use UTC/Z suffix.`,
+- cron: Standard cron expression (e.g., "*/5 * * * *" for every 5 minutes, "0 9 * * *" for daily at 9am LOCAL time)
+- interval: Milliseconds between runs (e.g., "300000" for 5 minutes, "3600000" for 1 hour)
+- once: Local time WITHOUT "Z" suffix (e.g., "2026-02-01T15:30:00"). Do NOT use UTC/Z suffix.`,
         {
           prompt: z.string().describe('What the agent should do when the task runs. For isolated mode, include all necessary context here.'),
           schedule_type: z.enum(['cron', 'interval', 'once']).describe('cron=recurring at specific times, interval=recurring every N ms, once=run once at specific time'),
           schedule_value: z.string().describe('cron: "*/5 * * * *" | interval: milliseconds like "300000" | once: local timestamp like "2026-02-01T15:30:00" (no Z suffix!)'),
           context_mode: z.enum(['group', 'isolated']).default('group').describe('group=runs with chat history and memory, isolated=fresh session (include context in prompt)'),
-          target_group: z.string().optional().describe('Target group folder (main only, defaults to current group)')
+          target_group: z.string().optional().describe('Target group folder (main channel only, defaults to current group)')
         },
         async (args) => {
           // Validate schedule_value before writing IPC
@@ -120,7 +120,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
             }
           }
 
-          // Non-main groups can only schedule for themselves
+          // Main channel can target any group; regular groups only schedule for themselves
           const targetGroup = isMain && args.target_group ? args.target_group : groupFolder;
 
           const data = {
@@ -149,7 +149,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
       // Reads from current_tasks.json which host keeps updated
       tool(
         'list_tasks',
-        'List all scheduled tasks. From main: shows all tasks. From other groups: shows only that group\'s tasks.',
+        'List all scheduled tasks. From main channel: shows all tasks. From other groups: shows only that group\'s tasks.',
         {},
         async () => {
           const tasksFile = path.join(IPC_DIR, 'current_tasks.json');
@@ -280,7 +280,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
 
       tool(
         'register_group',
-        `Register a new WhatsApp group so the agent can respond to messages there. Main group only.
+        `Register a new WhatsApp group so the agent can respond to messages there. Main channel only.
 
 Use available_groups.json to find the JID for a group. The folder name should be lowercase with hyphens (e.g., "family-chat").`,
         {
@@ -292,7 +292,7 @@ Use available_groups.json to find the JID for a group. The folder name should be
         async (args) => {
           if (!isMain) {
             return {
-              content: [{ type: 'text', text: 'Only the main group can register new groups.' }],
+              content: [{ type: 'text', text: 'Only the main channel can register new groups.' }],
               isError: true
             };
           }
@@ -315,7 +315,50 @@ Use available_groups.json to find the JID for a group. The folder name should be
             }]
           };
         }
-      )
+      ),
+
+      tool(
+        'update_group_config',
+        `Update guard or moderation configuration for a group. Main channel only.`,
+        {
+          jid: z.string().describe('The WhatsApp JID of the group to update'),
+          guards: z.array(z.object({
+            guardId: z.string(),
+            enabled: z.boolean(),
+            params: z.record(z.string(), z.unknown()).optional()
+          })).optional().describe('Guard configurations'),
+          moderation_config: z.object({
+            observationMode: z.boolean(),
+            adminExempt: z.boolean(),
+            dmCooldownSeconds: z.number()
+          }).optional().describe('Moderation settings')
+        },
+        async (args) => {
+          if (!isMain) {
+            return {
+              content: [{ type: 'text', text: 'Only the main channel can update group configs.' }],
+              isError: true
+            };
+          }
+
+          const data: Record<string, unknown> = {
+            type: 'update_group_config',
+            jid: args.jid,
+            timestamp: new Date().toISOString()
+          };
+          if (args.guards) data.guards = args.guards;
+          if (args.moderation_config) data.moderationConfig = args.moderation_config;
+
+          writeIpcFile(TASKS_DIR, data);
+
+          return {
+            content: [{
+              type: 'text',
+              text: `Config update queued for ${args.jid}.`
+            }]
+          };
+        }
+      ),
     ]
   });
 }
