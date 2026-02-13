@@ -45,9 +45,21 @@ Check if a token is already available:
 [ -f .env ] && echo "ENV_FILE_EXISTS" || echo "NO_ENV_FILE"
 ```
 
-**If `OAUTH_TOKEN_PRESENT`:** Tell the user their Claude Code subscription will be used automatically. Skip to step 4.
+**If `OAUTH_TOKEN_PRESENT` and `ENV_FILE_EXISTS`:** Tell the user their Claude Code subscription will be used. Skip to step 4.
 
-**If `API_KEY_PRESENT` (but no OAuth token):** Tell the user their API key will be used. Skip to step 4.
+**If `API_KEY_PRESENT` and `ENV_FILE_EXISTS`:** Tell the user their API key will be used. Skip to step 4.
+
+**If a token/key is present in the environment but NO `.env` file exists:** You MUST still write the `.env` file. Background services (launchd/systemd) don't inherit shell environment variables, so the `.env` file is required for the app to work when running as a service. Write the detected value to `.env`:
+
+```bash
+# For OAuth token:
+echo "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN" > .env
+
+# For API key:
+echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY" > .env
+```
+
+Tell the user: "I detected your key in the environment and saved it to `.env` so it works when running as a service."
 
 **If neither is present**, use `AskUserQuestion`:
 

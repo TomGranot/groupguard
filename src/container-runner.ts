@@ -169,7 +169,6 @@ function buildContainerArgs(mounts: VolumeMount[]): string[] {
     '--security-opt', 'no-new-privileges',
     '--memory=512m',
     '--cpus=1',
-    '--read-only',
     '--tmpfs', '/tmp:rw,noexec,nosuid,size=256m',
   ];
 

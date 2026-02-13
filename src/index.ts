@@ -38,6 +38,7 @@ let lastTimestamp = '';
 let sessions: Session = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
+let messageLoopRunning = false;
 
 async function setTyping(jid: string, isTyping: boolean): Promise<void> {
   try {
@@ -620,6 +621,11 @@ async function connectWhatsApp(): Promise<void> {
 }
 
 async function startMessageLoop(): Promise<void> {
+  if (messageLoopRunning) {
+    logger.debug('Message loop already running, skipping duplicate start');
+    return;
+  }
+  messageLoopRunning = true;
   logger.info(`GroupGuard running (trigger: @${ASSISTANT_NAME})`);
 
   while (true) {
