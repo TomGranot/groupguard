@@ -1,89 +1,106 @@
-#!/bin/bash
-# GroupGuard One-Command Setup
-#
-# Usage: ./setup.sh
-#
-# Prerequisites: Node.js 20+, Docker
+#!/usr/bin/env bash
+# GroupGuard guided setup
+# Usage: ./setup.sh [--skip-auth] [--skip-groups]
 
-set -e
+set -euo pipefail
 
-echo "=== GroupGuard Setup ==="
-echo ""
-
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-NC='\033[0m' # No Color
+YELLOW='\033[0;33m'
+BOLD='\033[1m'
+NC='\033[0m'
 
-ok() { echo -e "  ${GREEN}OK${NC} $1"; }
-fail() { echo -e "  ${RED}FAIL${NC} $1"; exit 1; }
+ok() { printf "  ${GREEN}OK${NC}    %s\n" "$1"; }
+info() { printf "  ${YELLOW}INFO${NC}  %s\n" "$1"; }
+fail() { printf "  ${RED}FAIL${NC}  %s\n" "$1"; exit 1; }
+
+SKIP_AUTH=false
+SKIP_GROUPS=false
+for argument in "$@"; do
+  case "$argument" in
+    --skip-auth) SKIP_AUTH=true ;;
+    --skip-groups) SKIP_GROUPS=true ;;
+    --help|-h)
+      echo "Usage: ./setup.sh [--skip-auth] [--skip-groups]"
+      exit 0
+      ;;
+    *) fail "Unknown option: $argument" ;;
+  esac
+done
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_ROOT"
 
-# --- Step 1: Check Node.js ---
-echo "Step 1: Checking Node.js..."
-if ! command -v node &>/dev/null; then
-  fail "Node.js not found. Install Node.js 20+ from https://nodejs.org"
-fi
+printf "\n${BOLD}GroupGuard setup${NC}\n\n"
+echo "GroupGuard uses WhatsApp's linked-device protocol because Meta's official API"
+echo "does not support group moderation. WhatsApp may restrict automated accounts."
+echo "Use a separate number that you can afford to lose."
+echo ""
+echo "Safe defaults in this setup:"
+echo "  • observation only; no message deletion"
+echo "  • AI agent and Docker disabled"
+echo "  • moderation DMs disabled"
+echo "  • bounded outbound actions and reconnects"
+echo ""
 
-NODE_VERSION=$(node -v | sed 's/v//' | cut -d. -f1)
-if [[ "$NODE_VERSION" -lt 20 ]]; then
-  fail "Node.js $NODE_VERSION found, but 20+ is required. Update from https://nodejs.org"
+if ! command -v node >/dev/null 2>&1; then
+  fail "Node.js is missing. Install Node.js 20 or newer from https://nodejs.org"
 fi
-ok "Node.js $(node -v)"
-
-# --- Step 2: Check Docker ---
-echo "Step 2: Checking Docker..."
-if ! command -v docker &>/dev/null; then
-  fail "Docker not found. Install Docker Desktop (macOS) or Docker Engine (Linux) from https://docker.com"
+NODE_MAJOR="$(node -p "process.versions.node.split('.')[0]")"
+if [ "$NODE_MAJOR" -lt 20 ]; then
+  fail "Node.js 20 or newer is required; found $(node --version)"
 fi
-if ! docker info &>/dev/null; then
-  fail "Docker is not running. Start Docker Desktop (macOS) or run: sudo systemctl start docker (Linux)"
-fi
-ok "Docker $(docker --version | awk '{print $3}' | tr -d ',')"
+ok "Node.js $(node --version)"
 
-# --- Step 3: Install dependencies ---
-echo "Step 3: Installing dependencies..."
-npm install --silent
-ok "npm packages installed"
+echo ""
+info "Installing pinned dependencies"
+npm ci --silent
+ok "Dependencies installed"
 
-# --- Step 4: Build container image ---
-echo "Step 4: Building container image..."
-./container/build.sh
-if docker run --rm --entrypoint echo groupguard-agent:latest "OK" &>/dev/null; then
-  ok "Container image built and verified"
+if [ ! -f .env ]; then
+  cp .env.example .env
+  ok "Created .env with safe defaults"
 else
-  fail "Container image build failed"
+  ok "Preserved existing .env"
 fi
+if [ "$(uname -s)" != "MINGW" ]; then chmod 600 .env; fi
 
-# --- Step 5: WhatsApp authentication ---
-echo "Step 5: WhatsApp authentication..."
-if [[ -d "store/auth" ]] && [[ -f "store/auth/creds.json" ]]; then
-  ok "Already authenticated (store/auth/ exists)"
-else
-  echo ""
-  echo "  A QR code will appear. Scan it with your phone:"
-  echo "  WhatsApp > Settings > Linked Devices > Link a Device"
-  echo ""
-  npm run auth
-  echo ""
-  ok "WhatsApp authenticated"
-fi
+mkdir -p data store logs
+if [ "$(uname -s)" != "MINGW" ]; then chmod 700 data store logs; fi
 
-# --- Step 6: Build TypeScript ---
-echo "Step 6: Building TypeScript..."
+info "Building GroupGuard"
 npm run build --silent
-ok "TypeScript compiled"
+ok "TypeScript build passed"
+npm test --silent
+ok "Safety tests passed"
 
-# --- Done ---
+if [ "$SKIP_AUTH" = false ]; then
+  if [ -f store/auth/creds.json ] && node -e "const c=require('./store/auth/creds.json');process.exit(c.registered?0:1)"; then
+    ok "WhatsApp is already linked"
+  else
+    echo ""
+    info "Linking WhatsApp. Pairing changes linked devices; it does not send messages."
+    npm run auth
+  fi
+fi
+
+if [ "$SKIP_GROUPS" = false ]; then
+  if [ -t 0 ]; then
+    npm run groups
+  else
+    info "No interactive terminal. Run npm run groups to choose groups."
+  fi
+fi
+
 echo ""
-echo "=== Setup Complete ==="
-echo ""
-echo "Run GroupGuard with:"
-echo "  npm run dev"
-echo ""
-echo "Other commands:"
-echo "  npm run auth     - Re-authenticate WhatsApp"
-echo "  npm run build    - Rebuild TypeScript"
-echo ""
+if npm run doctor; then
+  printf "${GREEN}${BOLD}Setup complete.${NC}\n\n"
+  echo "Start GroupGuard: npm start"
+  echo ""
+  echo "Test locally first. For 24/7 use, move the same directory to a dedicated"
+  echo "low-privilege VM. Keep observation mode on for at least one day before you"
+  echo "consider enforcement. See docs/SAFE-OPERATIONS.md."
+  echo ""
+else
+  fail "Setup needs attention. Fix the failed doctor checks, then run npm run doctor."
+fi

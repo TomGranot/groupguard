@@ -41,11 +41,22 @@ function askQuestion(question: string): Promise<string> {
 }
 
 async function authenticate(): Promise<void> {
-  fs.mkdirSync(AUTH_DIR, { recursive: true });
+  fs.mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
+
+  const secureAuthFiles = (): void => {
+    if (process.platform !== 'win32') fs.chmodSync(AUTH_DIR, 0o700);
+    for (const file of fs.readdirSync(AUTH_DIR)) {
+      const filePath = `${AUTH_DIR}/${file}`;
+      if (fs.statSync(filePath).isFile() && process.platform !== 'win32') {
+        fs.chmodSync(filePath, 0o600);
+      }
+    }
+  };
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
   if (state.creds.registered) {
+    secureAuthFiles();
     console.log('✓ Already authenticated with WhatsApp');
     console.log('  To re-authenticate, delete the store/auth folder and run again.');
     process.exit(0);
@@ -126,7 +137,10 @@ async function authenticate(): Promise<void> {
     }
   });
 
-  sock.ev.on('creds.update', saveCreds);
+  sock.ev.on('creds.update', async () => {
+    await saveCreds();
+    secureAuthFiles();
+  });
 }
 
 authenticate().catch((err) => {

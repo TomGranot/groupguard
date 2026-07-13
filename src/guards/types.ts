@@ -51,10 +51,12 @@ export interface ModerationConfig {
   observationMode: boolean;
   adminExempt: boolean;
   dmCooldownSeconds: number;
+  notifyOnDelete: boolean;
 }
 
 export const DEFAULT_MODERATION_CONFIG: ModerationConfig = {
   observationMode: true,
   adminExempt: true,
-  dmCooldownSeconds: 60,
+  dmCooldownSeconds: 300,
+  notifyOnDelete: false,
 };

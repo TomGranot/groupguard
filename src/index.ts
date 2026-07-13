@@ -5,9 +5,10 @@ import makeWASocket, {
   WASocket
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
-import { exec, execSync } from 'child_process';
+import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { createHmac } from 'crypto';
 
 import {
   ASSISTANT_NAME,
@@ -17,14 +18,30 @@ import {
   TRIGGER_PATTERN,
   IPC_POLL_INTERVAL,
   TIMEZONE,
-  MAIN_GROUP_FOLDER
+  MAIN_GROUP_FOLDER,
+  AGENT_ENABLED,
+  ENFORCEMENT_ENABLED,
+  MAX_OUTBOUND_MESSAGES_PER_MINUTE,
+  MAX_MODERATION_ACTIONS_PER_MINUTE,
+  MAX_MODERATION_DMS_PER_HOUR,
+  SAFETY_FAILURE_THRESHOLD,
+  SAFETY_CIRCUIT_COOLDOWN_MS,
+  WHATSAPP_ACTION_TIMEOUT_MS,
+  RECONNECT_MAX_ATTEMPTS,
+  RECONNECT_BASE_DELAY_MS,
+  RECONNECT_MAX_DELAY_MS,
+  TYPING_INDICATOR_ENABLED,
+  PUBLIC_PLAYGROUND_ENABLED,
 } from './config.js';
 import { RegisteredGroup, Session, NewMessage } from './types.js';
-import { initDatabase, storeMessage, storeChatMetadata, getNewMessages, getMessagesSince, getAllTasks, getTaskById, updateChatName, getAllChats, getLastGroupSync, setLastGroupSync, getModerationStats, getModerationLogs } from './db.js';
+import { initDatabase, storeMessage, storeChatMetadata, getNewMessages, getMessagesSince, getAllTasks, getTaskById, updateChatName, getAllChats, getLastGroupSync, setLastGroupSync, getModerationStats, getModerationLogs, claimPlaygroundEvent, finishPlaygroundEvent, getPlaygroundRateUsage } from './db.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot, AvailableGroup } from './container-runner.js';
 import { loadJson, saveJson } from './utils.js';
 import { initModerator, moderateMessage, refreshAdminCache, updateAdminCache } from './moderator.js';
+import { AccountSafetyController, withActionTimeout } from './account-safety.js';
+import { parseRegisteredGroups, registeredGroupSchema } from './group-config.js';
+import { parsePlaygroundCommand, PlaygroundResponder } from './playground.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -39,8 +56,36 @@ let sessions: Session = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+let backgroundLoopsStarted = false;
+let reconnectAttempts = 0;
+let reconnectTimer: NodeJS.Timeout | undefined;
+let stableConnectionTimer: NodeJS.Timeout | undefined;
+
+const accountSafety = new AccountSafetyController({
+  budgets: {
+    message: { limit: MAX_OUTBOUND_MESSAGES_PER_MINUTE, windowMs: 60_000 },
+    moderation: { limit: MAX_MODERATION_ACTIONS_PER_MINUTE, windowMs: 60_000 },
+    'moderation-dm': { limit: MAX_MODERATION_DMS_PER_HOUR, windowMs: 60 * 60_000 },
+  },
+  failureThreshold: SAFETY_FAILURE_THRESHOLD,
+  circuitCooldownMs: SAFETY_CIRCUIT_COOLDOWN_MS,
+});
+const playgroundResponder = new PlaygroundResponder();
+let playgroundAuditKey: Buffer | undefined;
+
+function hashPlaygroundActor(senderJid: string): string {
+  if (!playgroundAuditKey) {
+    const keyPath = path.join(STORE_DIR, 'playground-audit.key');
+    playgroundAuditKey = fs.readFileSync(keyPath);
+    if (playgroundAuditKey.length < 32) {
+      throw new Error('Playground audit key must contain at least 32 bytes');
+    }
+  }
+  return createHmac('sha256', playgroundAuditKey).update(senderJid).digest('hex').slice(0, 24);
+}
 
 async function setTyping(jid: string, isTyping: boolean): Promise<void> {
+  if (!TYPING_INDICATOR_ENABLED) return;
   try {
     await sock.sendPresenceUpdate(isTyping ? 'composing' : 'paused', jid);
   } catch (err) {
@@ -54,8 +99,18 @@ function loadState(): void {
   lastTimestamp = state.last_timestamp || '';
   lastAgentTimestamp = state.last_agent_timestamp || {};
   sessions = loadJson(path.join(DATA_DIR, 'sessions.json'), {});
-  registeredGroups = loadJson(path.join(DATA_DIR, 'registered_groups.json'), {});
-  logger.info({ groupCount: Object.keys(registeredGroups).length }, 'State loaded');
+  const rawGroups = loadJson<unknown>(path.join(DATA_DIR, 'registered_groups.json'), {});
+  const parsedGroups = parseRegisteredGroups(rawGroups);
+  registeredGroups = parsedGroups.groups;
+  for (const error of parsedGroups.errors) logger.error({ error }, 'Unsafe group configuration ignored');
+  logger.info(
+    {
+      groupCount: Object.keys(registeredGroups).length,
+      agentEnabled: AGENT_ENABLED,
+      enforcementEnabled: ENFORCEMENT_ENABLED,
+    },
+    'State loaded',
+  );
 }
 
 function saveState(): void {
@@ -64,7 +119,11 @@ function saveState(): void {
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
-  registeredGroups[jid] = group;
+  const parsed = parseRegisteredGroups({ [jid]: group });
+  if (parsed.errors.length > 0 || !parsed.groups[jid]) {
+    throw new Error(parsed.errors.join('; ') || 'Invalid group configuration');
+  }
+  registeredGroups[jid] = parsed.groups[jid];
   saveJson(path.join(DATA_DIR, 'registered_groups.json'), registeredGroups);
 
   // Create group folder
@@ -131,8 +190,10 @@ function getAvailableGroups(): AvailableGroup[] {
 }
 
 async function processMessage(msg: NewMessage): Promise<void> {
+  if (!AGENT_ENABLED) return;
   const group = registeredGroups[msg.chat_jid];
   if (!group) return;
+  if (group.playground?.enabled) return;
 
   const content = msg.content.trim();
   const isMain = group.folder === MAIN_GROUP_FOLDER;
@@ -224,13 +285,112 @@ async function runAgent(group: RegisteredGroup, prompt: string, chatJid: string)
   }
 }
 
-async function sendMessage(jid: string, text: string): Promise<void> {
-  try {
-    await sock.sendMessage(jid, { text });
-    logger.info({ jid, length: text.length }, 'Message sent');
-  } catch (err) {
-    logger.error({ jid, err }, 'Failed to send message');
+type SendOutcome = 'sent' | 'skipped' | 'unknown';
+
+async function sendMessage(jid: string, text: string): Promise<SendOutcome> {
+  const permit = accountSafety.reserve('message');
+  if (!permit.allowed) {
+    logger.warn({ jid, permit }, 'Outbound message skipped by account safety controller');
+    return 'skipped';
   }
+
+  try {
+    await withActionTimeout(sock.sendMessage(jid, { text }), WHATSAPP_ACTION_TIMEOUT_MS);
+    accountSafety.recordSuccess();
+    logger.info({ jid, length: text.length }, 'Message sent');
+    return 'sent';
+  } catch (err) {
+    const circuitOpened = accountSafety.recordFailure();
+    logger.error({ jid, err }, 'Failed to send message');
+    if (circuitOpened) logger.error(accountSafety.snapshot(), 'Account safety circuit opened');
+    return 'unknown';
+  }
+}
+
+function extractMessageText(msg: Parameters<typeof moderateMessage>[0]): string {
+  const message = msg.message;
+  if (!message) return '';
+  return (
+    message.conversation ||
+    message.extendedTextMessage?.text ||
+    message.imageMessage?.caption ||
+    message.videoMessage?.caption ||
+    ''
+  );
+}
+
+async function processPlaygroundMessage(
+  msg: Parameters<typeof moderateMessage>[0],
+  chatJid: string,
+  group: RegisteredGroup,
+): Promise<void> {
+  const config = group.playground;
+  const key = msg.key;
+  if (!PUBLIC_PLAYGROUND_ENABLED || !config?.enabled || !key || key.fromMe) return;
+
+  const messageId = key.id || '';
+  const senderJid = key.participant || '';
+  if (!messageId || !senderJid) return;
+
+  const text = extractMessageText(msg);
+  const command = parsePlaygroundCommand(text, group.trigger);
+  if (!command) return;
+
+  const eventKey = `playground:${chatJid}:${messageId}`;
+  let actorHash: string;
+  try {
+    actorHash = hashPlaygroundActor(senderJid);
+  } catch (err) {
+    logger.error({ err }, 'Playground audit key unavailable; command refused');
+    return;
+  }
+  const now = Date.now();
+  const timestamp = new Date(now).toISOString();
+  const claimed = claimPlaygroundEvent({
+    event_key: eventKey,
+    chat_jid: chatJid,
+    message_id: messageId,
+    actor_hash: actorHash,
+    command,
+    timestamp,
+  });
+  if (!claimed) {
+    logger.debug({ eventKey }, 'Duplicate playground command ignored');
+    return;
+  }
+
+  const durableUsage = getPlaygroundRateUsage({
+    chatJid,
+    actorHash,
+    actorSince: new Date(now - config.cooldownSeconds * 1_000).toISOString(),
+    groupSince: new Date(now - 60_000).toISOString(),
+  });
+  if (durableUsage.actorResponses > 1) {
+    finishPlaygroundEvent(eventKey, 'cooldown');
+    return;
+  }
+  if (durableUsage.groupResponses > config.maxResponsesPerMinute) {
+    finishPlaygroundEvent(eventKey, 'group-budget');
+    return;
+  }
+
+  const reply = playgroundResponder.respond({
+    chatJid,
+    senderJid,
+    text,
+    trigger: group.trigger,
+    config,
+    now,
+  });
+  if (!reply || !reply.text) {
+    finishPlaygroundEvent(eventKey, reply?.outcome || 'cooldown');
+    return;
+  }
+
+  const sendOutcome = await sendMessage(chatJid, reply.text);
+  const outcome = sendOutcome === 'sent' ? 'served' : sendOutcome;
+  finishPlaygroundEvent(eventKey, outcome);
+  logger.info({ chatJid, command: reply.command, outcome }, 'Playground command handled');
 }
 
 function startIpcWatcher(): void {
@@ -475,6 +635,8 @@ async function processTaskIpc(
           trigger: data.trigger,
           added_at: new Date().toISOString(),
           containerConfig: data.containerConfig,
+          guards: data.guards,
+          moderationConfig: data.moderationConfig,
         });
       } else {
         logger.warn({ data }, 'Invalid register_group request - missing required fields');
@@ -488,15 +650,29 @@ async function processTaskIpc(
         break;
       }
       if (data.jid && registeredGroups[data.jid]) {
-        const group = registeredGroups[data.jid];
-        if (data.guards !== undefined) {
-          group.guards = data.guards as RegisteredGroup['guards'];
+        const current = registeredGroups[data.jid];
+        const parsed = registeredGroupSchema.safeParse({
+          ...current,
+          guards: data.guards ?? current.guards,
+          moderationConfig: data.moderationConfig ?? current.moderationConfig,
+        });
+        if (!parsed.success) {
+          logger.warn(
+            { jid: data.jid, errors: parsed.error.issues },
+            'Unsafe group config update rejected',
+          );
+          break;
         }
-        if (data.moderationConfig !== undefined) {
-          group.moderationConfig = data.moderationConfig as RegisteredGroup['moderationConfig'];
-        }
+        registeredGroups[data.jid] = parsed.data;
         saveJson(path.join(DATA_DIR, 'registered_groups.json'), registeredGroups);
-        logger.info({ jid: data.jid, guards: group.guards?.length || 0, observationMode: group.moderationConfig?.observationMode }, 'Group config updated via IPC');
+        logger.info(
+          {
+            jid: data.jid,
+            guards: parsed.data.guards.length,
+            observationMode: parsed.data.moderationConfig.observationMode,
+          },
+          'Group config updated via IPC',
+        );
       } else {
         logger.warn({ jid: data.jid }, 'update_group_config: group not found');
       }
@@ -507,46 +683,86 @@ async function processTaskIpc(
   }
 }
 
+function stopForOperator(message: string, context?: Record<string, unknown>): never {
+  logger.fatal(context || {}, message);
+  // A clean exit tells systemd and launchd not to create a reconnect loop.
+  process.exit(0);
+}
+
+function scheduleReconnect(reason: unknown): void {
+  if (reconnectTimer) return;
+
+  if (reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
+    stopForOperator(
+      'WhatsApp reconnect budget exhausted; stopping to protect the account',
+      { reason, reconnectAttempts },
+    );
+  }
+
+  const exponentialDelay = Math.min(
+    RECONNECT_MAX_DELAY_MS,
+    RECONNECT_BASE_DELAY_MS * 2 ** reconnectAttempts,
+  );
+  const jitter = Math.floor(Math.random() * Math.max(250, exponentialDelay * 0.25));
+  const delayMs = exponentialDelay + jitter;
+  reconnectAttempts += 1;
+
+  logger.warn(
+    { reason, reconnectAttempts, maxAttempts: RECONNECT_MAX_ATTEMPTS, delayMs },
+    'WhatsApp connection closed; reconnect scheduled',
+  );
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = undefined;
+    connectWhatsApp().catch((err) => {
+      logger.error({ err }, 'WhatsApp reconnect attempt failed');
+      scheduleReconnect(err);
+    });
+  }, delayMs);
+}
+
 async function connectWhatsApp(): Promise<void> {
   const authDir = path.join(STORE_DIR, 'auth');
   fs.mkdirSync(authDir, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
-  sock = makeWASocket({
+  const currentSocket = makeWASocket({
     auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
     printQRInTerminal: false,
     logger,
     browser: ['GroupGuard', 'Chrome', '1.0.0']
   });
+  sock = currentSocket;
 
-  sock.ev.on('connection.update', (update) => {
+  currentSocket.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      const msg = 'WhatsApp authentication required. Run /setup in Claude Code.';
-      logger.error(msg);
-      exec(`osascript -e 'display notification "${msg}" with title "GroupGuard" sound name "Basso"'`);
-      setTimeout(() => process.exit(1), 1000);
+      stopForOperator('WhatsApp authentication required. Run npm run auth, then restart GroupGuard.');
     }
 
     if (connection === 'close') {
-      const reason = (lastDisconnect?.error as any)?.output?.statusCode;
-      const shouldReconnect = reason !== DisconnectReason.loggedOut;
-      logger.info({ reason, shouldReconnect }, 'Connection closed');
+      if (currentSocket !== sock) return;
+      if (stableConnectionTimer) clearTimeout(stableConnectionTimer);
 
-      if (shouldReconnect) {
-        logger.info('Reconnecting...');
-        connectWhatsApp();
-      } else {
-        logger.info('Logged out. Run /setup to re-authenticate.');
-        process.exit(0);
+      const reason = (lastDisconnect?.error as any)?.output?.statusCode;
+      if (reason === DisconnectReason.loggedOut) {
+        stopForOperator('WhatsApp logged out. Run npm run auth before restarting.');
       }
+
+      scheduleReconnect(reason);
     } else if (connection === 'open') {
       logger.info('Connected to WhatsApp');
 
+      // A connection must remain healthy before it earns a fresh retry budget.
+      stableConnectionTimer = setTimeout(() => {
+        reconnectAttempts = 0;
+        logger.debug('WhatsApp connection stable; reconnect budget reset');
+      }, 2 * 60 * 1000);
+
       // Initialize moderation system
-      initModerator(sock);
+      initModerator(currentSocket, accountSafety);
 
       // Refresh admin caches for all registered groups
       for (const chatJid of Object.keys(registeredGroups)) {
@@ -557,25 +773,35 @@ async function connectWhatsApp(): Promise<void> {
         }
       }
 
-      // Sync group metadata on startup (respects 24h cache)
+      // Sync group metadata after every connection (respects 24h cache).
       syncGroupMetadata().catch(err => logger.error({ err }, 'Initial group sync failed'));
-      // Set up daily sync timer
-      setInterval(() => {
-        syncGroupMetadata().catch(err => logger.error({ err }, 'Periodic group sync failed'));
-      }, GROUP_SYNC_INTERVAL_MS);
-      startSchedulerLoop({
-        sendMessage,
-        registeredGroups: () => registeredGroups,
-        getSessions: () => sessions
-      });
-      startIpcWatcher();
-      startMessageLoop();
+
+      if (!backgroundLoopsStarted) {
+        backgroundLoopsStarted = true;
+        setInterval(() => {
+          syncGroupMetadata().catch(err => logger.error({ err }, 'Periodic group sync failed'));
+        }, GROUP_SYNC_INTERVAL_MS);
+
+        if (AGENT_ENABLED) {
+          startSchedulerLoop({
+            sendMessage: async (jid, text) => {
+              await sendMessage(jid, text);
+            },
+            registeredGroups: () => registeredGroups,
+            getSessions: () => sessions
+          });
+          startIpcWatcher();
+          startMessageLoop();
+        } else {
+          logger.info('Moderation-only mode active; Docker and AI agent features are disabled');
+        }
+      }
     }
   });
 
-  sock.ev.on('creds.update', saveCreds);
+  currentSocket.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('messages.upsert', async ({ messages }) => {
+  currentSocket.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
       if (!msg.message) continue;
       const chatJid = msg.key.remoteJid;
@@ -592,6 +818,13 @@ async function connectWhatsApp(): Promise<void> {
       // Process messages for registered groups
       if (registeredGroups[chatJid]) {
         const group = registeredGroups[chatJid];
+
+        // The public surface stores only fixed-command audit events. It never
+        // sends visitor content through moderation, message history, or AI.
+        if (PUBLIC_PLAYGROUND_ENABLED && group.playground?.enabled) {
+          await processPlaygroundMessage(msg, chatJid, group);
+          continue;
+        }
 
         // Run moderation guards BEFORE storing the message
         if (group?.guards && group.guards.length > 0 && chatJid.endsWith('@g.us')) {
@@ -610,7 +843,7 @@ async function connectWhatsApp(): Promise<void> {
   });
 
   // Track group membership changes for admin cache updates
-  sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
+  currentSocket.ev.on('group-participants.update', async ({ id, participants, action }) => {
     logger.info({ chatJid: id, action, count: participants.length }, 'Group participants updated');
 
     // Refresh admin cache when participants change
@@ -654,6 +887,11 @@ async function startMessageLoop(): Promise<void> {
 }
 
 function ensureRuntimeRunning(): void {
+  if (!AGENT_ENABLED) {
+    logger.info('Docker check skipped because the optional agent is disabled');
+    return;
+  }
+
   try {
     execSync('docker info', { stdio: 'pipe', timeout: 10000 });
     logger.debug('Docker is running');

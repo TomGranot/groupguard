@@ -4,6 +4,18 @@ Original requirements and design decisions from the project creator.
 
 ---
 
+## Current Product Priorities
+
+These priorities supersede older setup and runtime assumptions in this document:
+
+1. A new operator can install, link WhatsApp, select groups, and validate the runtime through one guided command.
+2. The moderation core works without Docker, Claude, or an API key.
+3. New groups observe first. Consequential actions require a local operator gate, verified metadata, durable deduplication, action budgets, and bounded retries.
+4. Documentation recommends a separate WhatsApp number, a local foreground test, and a dedicated low-privilege VM for continuous operation.
+5. Optional agent capabilities stay disabled and read-only until the operator enables them.
+
+---
+
 ## Why This Exists
 
 This is a lightweight, secure alternative to OpenClaw (formerly ClawBot). That project became a monstrosity - 4-5 different processes running different gateways, endless configuration files, endless integrations. It's a security nightmare where agents don't run in isolated processes; there's all kinds of leaky workarounds trying to prevent them from accessing parts of the system they shouldn't. It's impossible for anyone to realistically understand the whole codebase. When you run it you're kind of just yoloing it.
@@ -30,11 +42,9 @@ This isn't a framework or a platform. It's working software for my specific need
 
 No configuration sprawl. If you want different behavior, modify the code. The codebase is small enough that this is safe and practical. Very minimal things like the trigger word are in config. Everything else - just change the code to do what you want.
 
-### AI-Native Development
+### CLI-First Operations
 
-I don't need an installation wizard - Claude Code guides the setup. I don't need a monitoring dashboard - I ask Claude Code what's happening. I don't need elaborate logging UIs - I ask Claude to read the logs. I don't need debugging tools - I describe the problem and Claude fixes it.
-
-The codebase assumes you have an AI collaborator. It doesn't need to be excessively self-documenting or self-debugging because Claude is always there.
+Setup and diagnostics must work without an AI collaborator. `./setup.sh` owns first-run onboarding and `npm run doctor` checks the installation. Claude can help with customization after the moderation core works.
 
 ### Skills Over Features
 
@@ -64,7 +74,8 @@ Skills to add or switch to different messaging platforms:
 A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 
 **Core components:**
-- **Claude Agent SDK** as the core agent
+- **Local guard engine** as the default moderation path
+- **Claude Agent SDK** as an optional agent
 - **Docker** for isolated agent execution (Linux containers)
 - **WhatsApp** as the primary I/O channel
 - **Persistent memory** per conversation and globally
@@ -98,7 +109,7 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 - Sessions auto-compact when context gets too long, preserving critical information
 
 ### Container Isolation
-- All agents run inside Docker containers
+- Optional agents run inside Docker containers
 - Each agent invocation spawns a container with mounted directories
 - Containers provide filesystem isolation - agents can only see mounted paths
 - Bash access is safe because commands run inside the container, not on the host
@@ -160,8 +171,8 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 
 ### Philosophy
 - Minimal configuration files
-- Setup and customization done via Claude Code
-- Users clone the repo and run Claude Code to configure
+- Guided setup and diagnostics work from the terminal
+- Claude Code remains optional for customization
 - Each user gets a custom setup matching their exact needs
 
 ### Skills
@@ -172,6 +183,7 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 - macOS: runs via launchd service
 - Linux: runs via systemd service
 - Single Node.js process handles everything
+- Moderation-only deployment does not require Docker
 
 ---
 

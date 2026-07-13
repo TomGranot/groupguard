@@ -1,6 +1,10 @@
 # GroupGuard Specification
 
-A personal Claude assistant accessible via WhatsApp, with persistent memory per conversation, scheduled tasks, and email integration.
+GroupGuard is a WhatsApp moderation daemon with an optional containerized Claude agent.
+
+The moderation path runs without Docker or AI credentials. It evaluates local guards, records decisions, deduplicates mutations, applies account budgets, and fails open when administrator identity is uncertain. The message loop, scheduler, IPC watcher, and Docker sections below apply only when `GROUPGUARD_AGENT_ENABLED=true`.
+
+Read [Safe Operations](SAFE-OPERATIONS.md) for the enforcement gates and deployment defaults.
 
 ---
 
@@ -75,8 +79,8 @@ A personal Claude assistant accessible via WhatsApp, with persistent memory per 
 |-----------|------------|---------|
 | WhatsApp Connection | Node.js (@whiskeysockets/baileys) | Connect to WhatsApp, send/receive messages |
 | Message Storage | SQLite (better-sqlite3) | Store messages for polling |
-| Container Runtime | Docker | Isolated Linux containers for agent execution |
-| Agent | @anthropic-ai/claude-agent-sdk (0.2.29) | Run Claude with tools and MCP servers |
+| Container Runtime | Docker (optional) | Isolated Linux containers for agent execution |
+| Agent | @anthropic-ai/claude-agent-sdk (optional) | Run Claude with tools and MCP servers |
 | Browser Automation | agent-browser + Chromium | Web interaction and screenshots |
 | Runtime | Node.js 20+ | Host process for routing and scheduling |
 
@@ -103,6 +107,13 @@ groupguard/
 │   ├── types.ts                   # TypeScript interfaces
 │   ├── utils.ts                   # Generic utility functions
 │   ├── db.ts                      # Database initialization and queries
+│   ├── account-safety.ts          # Action budgets and failure circuit
+│   ├── group-config.ts            # Strict group config and safe defaults
+│   ├── configure-groups.ts        # Guided group selection
+│   ├── enforcement-cli.ts         # Graduated enforcement controls
+│   ├── playground.ts              # Fixed-command public demo responder
+│   ├── playground-cli.ts          # Sealed playground profile controls
+│   ├── doctor.ts                  # Installation diagnostics
 │   ├── whatsapp-auth.ts           # Standalone WhatsApp authentication
 │   ├── task-scheduler.ts          # Runs scheduled tasks when due
 │   └── container-runner.ts        # Spawns agents in Docker containers
@@ -148,7 +159,6 @@ groupguard/
 │   ├── sessions.json              # Active session IDs per group
 │   ├── registered_groups.json     # Group JID → folder mapping
 │   ├── router_state.json          # Last processed timestamp + last agent timestamps
-│   ├── env/env                    # Copy of .env for container mounting
 │   └── ipc/                       # Container IPC (messages/, tasks/)
 │
 ├── logs/                          # Runtime logs (gitignored)

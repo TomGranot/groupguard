@@ -19,12 +19,19 @@ WEBHOOK_URL="${2:-}"
 SERVICE_NAME="groupguard"
 LOG_FILE="/tmp/groupguard-health.log"
 MAX_IDLE_SECONDS="${MAX_IDLE_SECONDS:-3600}"  # Alert if no activity for 1 hour
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+AGENT_ENABLED="false"
+if [ -f "$PROJECT_ROOT/.env" ]; then
+  configured_agent=$(sed -n 's/^GROUPGUARD_AGENT_ENABLED=//p' "$PROJECT_ROOT/.env" | tail -1)
+  AGENT_ENABLED="${configured_agent:-false}"
+fi
 
 healthy=true
 issues=()
 
 check_process() {
-  if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+  if systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null || \
+     systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
     echo "[OK] Service is running"
   else
     echo "[FAIL] Service is not running"
@@ -34,6 +41,10 @@ check_process() {
 }
 
 check_docker() {
+  if [ "$AGENT_ENABLED" != "true" ]; then
+    echo "[OK] Docker not required in moderation-only mode"
+    return
+  fi
   if docker info &>/dev/null; then
     echo "[OK] Docker is running"
   else
