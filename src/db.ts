@@ -74,6 +74,39 @@ export function initDatabase(): void {
     );
     CREATE INDEX IF NOT EXISTS idx_modlog_chat ON moderation_log(chat_jid, timestamp);
     CREATE INDEX IF NOT EXISTS idx_modlog_sender ON moderation_log(sender_jid, timestamp);
+
+    CREATE TABLE IF NOT EXISTS moderation_actions (
+      action_key TEXT PRIMARY KEY,
+      chat_jid TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      sender_jid TEXT NOT NULL,
+      guard_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      status TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_modaction_status
+      ON moderation_actions(status, updated_at);
+
+    CREATE TABLE IF NOT EXISTS playground_events (
+      event_key TEXT PRIMARY KEY,
+      chat_jid TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      actor_hash TEXT NOT NULL,
+      command TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_playground_events_time
+      ON playground_events(created_at);
+    CREATE INDEX IF NOT EXISTS idx_playground_events_chat_time
+      ON playground_events(chat_jid, created_at);
+    CREATE INDEX IF NOT EXISTS idx_playground_events_actor_time
+      ON playground_events(actor_hash, created_at);
   `);
 
   // Add sender_name column if it doesn't exist (migration for existing DBs)
@@ -324,6 +357,115 @@ export function logModeration(entry: ModerationLogEntry): void {
     entry.message_id,
     entry.timestamp,
   );
+}
+
+export interface ModerationActionClaim {
+  action_key: string;
+  chat_jid: string;
+  message_id: string;
+  sender_jid: string;
+  guard_id: string;
+  action: string;
+  reason: string;
+  timestamp: string;
+}
+
+/**
+ * Durable at-most-once gate for moderation side effects. A replay of the same
+ * WhatsApp event cannot delete or notify twice, including after a restart.
+ */
+export function claimModerationAction(claim: ModerationActionClaim): boolean {
+  const result = db.prepare(`
+    INSERT OR IGNORE INTO moderation_actions (
+      action_key, chat_jid, message_id, sender_jid, guard_id,
+      action, status, reason, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+  `).run(
+    claim.action_key,
+    claim.chat_jid,
+    claim.message_id,
+    claim.sender_jid,
+    claim.guard_id,
+    claim.action,
+    claim.reason,
+    claim.timestamp,
+    claim.timestamp,
+  );
+  return result.changes === 1;
+}
+
+export function finishModerationAction(
+  actionKey: string,
+  status: 'completed' | 'skipped' | 'unknown',
+  error?: string,
+): void {
+  db.prepare(`
+    UPDATE moderation_actions
+    SET status = ?, error = ?, updated_at = ?
+    WHERE action_key = ?
+  `).run(status, error || null, new Date().toISOString(), actionKey);
+}
+
+export interface PlaygroundEventClaim {
+  event_key: string;
+  chat_jid: string;
+  message_id: string;
+  actor_hash: string;
+  command: string;
+  timestamp: string;
+}
+
+export function claimPlaygroundEvent(claim: PlaygroundEventClaim): boolean {
+  const result = db.prepare(`
+    INSERT OR IGNORE INTO playground_events (
+      event_key, chat_jid, message_id, actor_hash, command,
+      outcome, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+  `).run(
+    claim.event_key,
+    claim.chat_jid,
+    claim.message_id,
+    claim.actor_hash,
+    claim.command,
+    claim.timestamp,
+    claim.timestamp,
+  );
+  return result.changes === 1;
+}
+
+export function finishPlaygroundEvent(
+  eventKey: string,
+  outcome: 'served' | 'cooldown' | 'group-budget' | 'skipped' | 'unknown',
+): void {
+  db.prepare(`
+    UPDATE playground_events
+    SET outcome = ?, updated_at = ?
+    WHERE event_key = ?
+  `).run(outcome, new Date().toISOString(), eventKey);
+}
+
+export function getPlaygroundRateUsage(input: {
+  chatJid: string;
+  actorHash: string;
+  actorSince: string;
+  groupSince: string;
+}): { actorResponses: number; groupResponses: number } {
+  const countedOutcomes = "'pending','served','unknown'";
+  const actor = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM playground_events
+    WHERE actor_hash = ?
+      AND created_at > ?
+      AND outcome IN (${countedOutcomes})
+  `).get(input.actorHash, input.actorSince) as { count: number };
+  const group = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM playground_events
+    WHERE chat_jid = ?
+      AND created_at > ?
+      AND outcome IN (${countedOutcomes})
+  `).get(input.chatJid, input.groupSince) as { count: number };
+  return { actorResponses: actor.count, groupResponses: group.count };
 }
 
 export function getModerationLogs(chatJid: string, limit = 50): ModerationLogEntry[] {

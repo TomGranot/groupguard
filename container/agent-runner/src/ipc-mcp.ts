@@ -330,7 +330,8 @@ Use available_groups.json to find the JID for a group. The folder name should be
           moderation_config: z.object({
             observationMode: z.boolean(),
             adminExempt: z.boolean(),
-            dmCooldownSeconds: z.number()
+            dmCooldownSeconds: z.number().int().min(60).max(86400),
+            notifyOnDelete: z.boolean().default(false)
           }).optional().describe('Moderation settings')
         },
         async (args) => {

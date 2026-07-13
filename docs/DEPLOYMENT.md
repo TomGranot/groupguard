@@ -1,99 +1,121 @@
 # Deploying GroupGuard
 
-GroupGuard works great locally, but for 24/7 availability you'll want it on a server. It needs Docker to spawn agent containers, which rules out most managed platforms (Railway, Render, Fly.io) — you need a real VM.
+Use a local foreground process for setup and observation. Use a dedicated VM for 24/7 moderation.
 
-## Local macOS (free)
+The moderation-only profile needs Node.js 20 or newer. It does not need Docker, an AI provider, a public port, or a reverse proxy.
 
-Install [Docker Desktop](https://docker.com/products/docker-desktop), then:
+## Recommended production layout
+
+- A separate WhatsApp number
+- One small Linux VM
+- One low-privilege OS user
+- Encrypted disk where the provider supports it
+- One GroupGuard process and one private state directory
+- systemd supervision
+- SSH or Tailscale for administration
+
+Do not expose GroupGuard to the public internet. It has no web control plane.
+
+## Linux VM
+
+Ubuntu 24.04 with 1 shared vCPU, 1 GB RAM, and 10 GB disk is enough for moderation-only use. The optional Claude agent needs Docker and more memory.
+
+Install Node.js using your preferred version manager, then run:
 
 ```bash
-git clone git@github.com:TomGranot/groupguard.git
+git clone https://github.com/TomGranot/groupguard.git
 cd groupguard
 ./setup.sh
 ```
 
-## Hetzner VPS (~$4/month, always-on)
+Link WhatsApp and choose groups from the interactive setup. Keep enforcement off during the observation period.
 
-Best value for an always-on server.
-
-1. Create a [Hetzner Cloud](https://www.hetzner.com/cloud/) server: **CX22** (2 vCPU, 4 GB RAM, 40 GB disk), **Docker CE** app image, Ubuntu 24.04
-2. SSH in and run:
+Install a per-user systemd service:
 
 ```bash
-# Install Node.js
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
-source ~/.bashrc && nvm install 22
+./scripts/install-service.sh
+systemctl --user status groupguard
+```
 
-# Clone and set up
-git clone git@github.com:TomGranot/groupguard.git /opt/groupguard
-cd /opt/groupguard
-echo 'ANTHROPIC_API_KEY=your-key-here' > .env
+Ask the host administrator to enable user lingering if the service must start before you log in:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+The service reads `.env`, writes logs under `logs/`, and restarts after process failures. GroupGuard limits its own WhatsApp reconnect attempts and exits when that budget runs out.
+
+## Local macOS
+
+Run setup and observe in the foreground first:
+
+```bash
 ./setup.sh
-
-# Authenticate WhatsApp (scan QR with your phone)
-npm run auth
-
-# Start the service
-sudo systemctl start groupguard
+npm start
 ```
 
-**Specs:** 2 vCPU, 4 GB RAM (dedicated), 40 GB NVMe, 20 TB traffic. ~EUR 3.49/month.
-
-## Other VPS Options
-
-| Provider | Cost | Notes |
-|----------|------|-------|
-| **DigitalOcean** | $6-12/mo | Docker 1-Click Marketplace image. [digitalocean.com](https://www.digitalocean.com) |
-| **Vultr** | $6-10/mo | Startup scripts for automated setup. [vultr.com](https://www.vultr.com) |
-| **Linode/Akamai** | $5/mo+ | StackScripts for parameterized deployment. [linode.com](https://www.linode.com) |
-| **Oracle Cloud** | Free | ARM A1 instance. Generous but hard to provision — expect "out of capacity" errors. [oracle.com/cloud/free](https://www.oracle.com/cloud/free/) |
-
-All options need Docker installed. The setup is the same everywhere: clone, `./setup.sh`, `npm run auth`, start the service.
-
-## Running as a Service
-
-### Linux (systemd)
-
-The setup script installs a systemd service automatically. Manual control:
+Install a per-user launchd service only if the Mac stays awake and connected:
 
 ```bash
-sudo systemctl start groupguard
-sudo systemctl stop groupguard
-sudo systemctl restart groupguard
-sudo systemctl status groupguard
+./scripts/install-service.sh
+launchctl print "gui/$UID/com.groupguard"
 ```
 
-### macOS (launchd)
+A laptop is useful for testing but unreliable for continuous moderation because sleep and network changes interrupt the linked-device session.
 
-```bash
-# Install
-cp launchd/com.groupguard.plist ~/Library/LaunchAgents/
+## Optional agent profile
 
-# Start/stop
-launchctl load ~/Library/LaunchAgents/com.groupguard.plist
-launchctl unload ~/Library/LaunchAgents/com.groupguard.plist
+Install Docker only when you need the Claude agent. Then:
 
-# Check status
-launchctl list | grep groupguard
-```
+1. Add `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` to `.env`.
+2. Set `GROUPGUARD_AGENT_ENABLED=true`.
+3. Keep `GROUPGUARD_AGENT_PROJECT_WRITE_ENABLED=false`.
+4. Run `./container/build.sh`.
+5. Run `npm run doctor`.
+6. Restart the service.
+
+Plan for at least 2 vCPU and 4 GB RAM when agent containers run.
 
 ## Updating
 
+Stop the service before changing dependencies or database code:
+
 ```bash
-cd /opt/groupguard
-git pull
-npm install
+systemctl --user stop groupguard
+cp -a data "data.backup.$(date +%Y%m%d)"
+cp -a store "store.backup.$(date +%Y%m%d)"
+git pull --ff-only
+npm ci
+npm test
 npm run build
-./container/build.sh
-sudo systemctl restart groupguard  # or launchctl on macOS
+npm run doctor
+systemctl --user start groupguard
 ```
 
-## Troubleshooting
+Return all groups to observation mode before a transport or schema upgrade.
 
-- **Docker not running** — macOS: start Docker Desktop. Linux: `sudo systemctl start docker`
-- **WhatsApp auth expired** — Run `npm run auth` to re-authenticate, then restart
-- **Service not starting** — Check `logs/groupguard.log` and `logs/groupguard.error.log`
-- **No response to messages** — Verify the group is registered and the trigger pattern matches
-- **Guards not working** — Check the moderation log: `sqlite3 store/messages.db "SELECT * FROM moderation_log ORDER BY timestamp DESC LIMIT 10"`
+## Health and logs
 
-Run `/debug` in Claude Code for guided troubleshooting.
+```bash
+npm run doctor
+systemctl --user status groupguard
+journalctl --user -u groupguard -n 200 --no-pager
+sqlite3 store/messages.db \
+  "SELECT timestamp, guard_id, action, reason FROM moderation_log ORDER BY timestamp DESC LIMIT 50"
+```
+
+The older `scripts/health-check.sh` targets a system-wide Linux service. Prefer `npm run doctor` for configuration checks and your service supervisor for liveness.
+
+## State and backups
+
+Protect these paths:
+
+| Path | Contents | Sensitivity |
+|---|---|---|
+| `.env` | Runtime settings and optional AI credentials | Secret |
+| `store/auth` | Linked WhatsApp session | Critical credential |
+| `store/messages.db` | Messages, tasks, moderation audit | Private data |
+| `data` | Group and session state | Private data |
+| `groups` | Per-group memory and files | Private data |
+
+Use one writable copy of `store/auth` per number. Never mount it into an agent container or share it between production and development.

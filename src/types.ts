@@ -33,14 +33,27 @@ export interface ContainerConfig {
   env?: Record<string, string>;
 }
 
+export interface PlaygroundConfig {
+  enabled: boolean;
+  setupUrl: string;
+  cooldownSeconds: number;
+  maxResponsesPerMinute: number;
+}
+
 export interface RegisteredGroup {
   name: string;
   folder: string;
   trigger: string;
   added_at: string;
   containerConfig?: ContainerConfig;
+  playground?: PlaygroundConfig;
   guards?: Array<{ guardId: string; enabled: boolean; params?: Record<string, unknown> }>;
-  moderationConfig?: { observationMode: boolean; adminExempt: boolean; dmCooldownSeconds: number };
+  moderationConfig?: {
+    observationMode: boolean;
+    adminExempt: boolean;
+    dmCooldownSeconds: number;
+    notifyOnDelete: boolean;
+  };
 }
 
 export interface Session {

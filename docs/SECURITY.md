@@ -1,5 +1,15 @@
 # GroupGuard Security Model
 
+## Default Runtime
+
+GroupGuard starts as a local moderation daemon. The AI agent, Docker containers, message deletion, and moderation DMs are disabled. This keeps untrusted group messages out of an autonomous tool loop unless the operator opts in.
+
+Message enforcement uses two independent gates: the group must leave observation mode and the operator must set `GROUPGUARD_ENFORCEMENT_ENABLED=true` outside WhatsApp.
+
+Before every deletion, GroupGuard requires a stable message ID, claims a durable idempotency key, verifies the admin cache, checks the account action budget, and checks the shared failure circuit. An uncertain timeout is not retried.
+
+A public playground uses a separate data path. It recognizes a fixed command allowlist, does not store public message bodies, and never routes visitor content to moderation guards or the optional agent. Event records contain the command and an HMAC-based visitor pseudonym. The HMAC key stays in the private local state directory.
+
 ## Trust Model
 
 | Entity | Trust Level | Rationale |
@@ -20,6 +30,8 @@ Agents execute in Docker containers, providing:
 - **Ephemeral containers** - Fresh environment per invocation (`--rm`)
 
 This is the primary security boundary. Rather than relying on application-level permission checks, the attack surface is limited by what's mounted.
+
+The container does not remove network or prompt-injection risk. Agent mode remains an explicit opt-in.
 
 ### 2. Mount Security
 
@@ -82,12 +94,14 @@ const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
 
 | Capability | Main Group | Non-Main Group |
 |------------|------------|----------------|
-| Project root access | `/workspace/project` (rw) | None |
+| Project root access | `/workspace/project` (read-only by default) | None |
 | Group folder | `/workspace/group` (rw) | `/workspace/group` (rw) |
 | Global memory | Implicit via project | `/workspace/global` (ro) |
 | Additional mounts | Configurable | Read-only unless allowed |
 | Network access | Unrestricted | Unrestricted |
 | MCP tools | All | All |
+
+Set `GROUPGUARD_AGENT_PROJECT_WRITE_ENABLED=true` only for a supervised maintenance session. Restore it to `false` before normal operation.
 
 ## Security Architecture Diagram
 

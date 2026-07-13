@@ -13,8 +13,7 @@ function getCompiledPatterns(config: { params?: Record<string, unknown> }, chatJ
   const patterns = (config.params?.patterns as string[]) || [];
   const keywords = (config.params?.keywords as string[]) || [];
 
-  // Simple cache key — invalidates if list changes length
-  const cacheKey = `${chatJid}:${patterns.length}:${keywords.length}`;
+  const cacheKey = `${chatJid}:${JSON.stringify({ patterns, keywords })}`;
   const cached = regexCache.get(cacheKey);
   if (cached) return cached;
 

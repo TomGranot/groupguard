@@ -1,140 +1,168 @@
 <h1 align="center">GroupGuard</h1>
-<p align="center">AI-powered moderation for WhatsApp groups</p>
+<p align="center">Safety-first moderation for WhatsApp groups</p>
 
 <p align="center">
   <img src="assets/groupguard-banner.png" alt="GroupGuard" width="600">
 </p>
 
 <p align="center">
-  Proudly powered by <a href="https://github.com/qwibitai/nanoclaw">NanoClaw</a>
-</p>
-
-<p align="center">
   <a href="https://groupguard.granot.io">Website</a> &middot;
-  <a href="https://chat.whatsapp.com/FjYwJkAZuWlF4jYO12SBoW">Support Group</a> &middot;
+  <a href="docs/PLAYGROUND.md">Playground</a> &middot;
+  <a href="docs/SAFE-OPERATIONS.md">Safe operations</a> &middot;
   <a href="docs/DEPLOYMENT.md">Deploy</a> &middot;
-  <a href="docs/SPEC.md">Docs</a>
+  <a href="docs/SPEC.md">Architecture</a>
 </p>
 
-<p align="center">
-  <a href="https://chat.whatsapp.com/FjYwJkAZuWlF4jYO12SBoW"><img src="https://img.shields.io/badge/WhatsApp-25D366?logo=whatsapp&logoColor=white" alt="WhatsApp"></a>
-  <img src="https://img.shields.io/badge/Powered_by-Claude-cc785c?logo=anthropic&logoColor=white" alt="Powered by Claude">
-  <img src="https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white" alt="Docker">
-  <img src="https://img.shields.io/badge/License-MIT-blue" alt="MIT License">
-</p>
+GroupGuard watches selected WhatsApp groups, evaluates local rules, and records violations. It starts in observation mode. Deletions require a 24-hour observation period, a per-group setting, and an operator-side lock outside WhatsApp.
 
-## Quick Start
+The moderation core needs Node.js and a linked WhatsApp account. Docker, Claude, and API credentials are optional.
+
+> [!WARNING]
+> GroupGuard uses WhatsApp's unofficial linked-device protocol because Meta's official API does not expose group moderation. WhatsApp may restrict automated accounts. Use a separate number that you can afford to lose.
+
+## Quick start
+
+Requirements: Node.js 20 or newer and a WhatsApp account.
 
 ```bash
-git clone git@github.com:TomGranot/groupguard.git
+git clone https://github.com/TomGranot/groupguard.git
 cd groupguard
 ./setup.sh
 ```
 
-Or use Claude Code for guided setup: run `claude` then `/setup`.
+Setup installs pinned dependencies, links WhatsApp, lists your groups, writes conservative settings, builds the app, and runs diagnostics.
 
-**Requirements:** Node.js 20+, Docker, [Claude Code](https://claude.ai/download)
+Start it in the foreground for the first test:
 
-## What It Does
-
-GroupGuard sits in your WhatsApp groups and enforces rules automatically. Beyond moderation, it's a full Claude assistant — it can answer questions, search the web, schedule tasks, and manage files. The moderation runs silently in the background.
-
+```bash
+npm start
 ```
-@GroupGuard enable no-spam and no-links for this group
-@GroupGuard set observation mode — log violations but don't delete
-@GroupGuard add a keyword filter blocking "crypto" and "forex"
-@GroupGuard show moderation stats for the last week
-@GroupGuard what's the weather in Tel Aviv?
+
+Useful commands:
+
+```bash
+npm run groups                 # Add groups
+npm run doctor                 # Validate auth, config, permissions, and runtime
+npm run enforcement -- status # Show each group's mode
+npm run playground -- status  # Inspect the public demo profile
+npm test                       # Run safety tests
 ```
+
+## Try before setup
+
+A public **GroupGuard Playground** can make the first product experience a WhatsApp group instead of an installation guide. Visitors run one of four fixed commands, see a simulated guard decision, and can continue to **Protect my group**.
+
+The sealed playground profile requires a dedicated number and installation. It disables AI, enforcement, DMs, and typing indicators; accepts no free-form prompts; rate-limits responses; and deduplicates commands by message ID.
+
+Read [GroupGuard Playground](docs/PLAYGROUND.md) for the welcome copy, deployment steps, safety boundary, and launch checklist.
+
+### Existing installations
+
+Back up `data` and `store`, pull the update, then run `npm ci`, `npm run build`, and `npm run doctor`. The upgrade disables the optional agent and closes the enforcement lock unless `.env` enables them. Existing raw regex filters also need the local `GROUPGUARD_ALLOW_REGEX_FILTERS=true` opt-in.
+
+## Defaults that protect the account
+
+- Observation mode for every new group
+- One starter guard: `no-spam`
+- No deletion until the operator unlocks enforcement
+- No unsolicited moderation DMs
+- Admins exempt from guards
+- No enforcement when the admin list cannot be verified
+- Durable deduplication for moderation actions
+- Per-account action budgets and a failure circuit breaker
+- Bounded reconnect attempts with exponential backoff and jitter
+- AI agent disabled
+- Agent project access read-only when the agent is enabled
+
+GroupGuard favors a missed action over repeated or uncertain account mutations.
+
+## Moving from observation to enforcement
+
+Leave a new group in observation mode for at least 24 hours. Review its log before enabling deletions:
+
+```bash
+sqlite3 store/messages.db \
+  "SELECT timestamp, guard_id, reason FROM moderation_log ORDER BY timestamp DESC LIMIT 50"
+```
+
+List folder names, then enable one group:
+
+```bash
+npm run enforcement -- status
+npm run enforcement -- enable family-chat
+```
+
+The command refuses early activation, opens the operator lock in `.env`, and changes only the named group. Restart GroupGuard and verify the result:
+
+```bash
+npm run doctor
+npm start
+```
+
+Return to observation mode at any time:
+
+```bash
+npm run enforcement -- disable family-chat
+```
+
+Read [Safe Operations](docs/SAFE-OPERATIONS.md) before enabling enforcement.
 
 ## Guards
 
-14 built-in moderation rules. Each group gets its own configuration — mix and match as needed.
+Each group has its own guard list and thresholds.
 
-### Content Type Guards
-
-Control what *format* of messages are allowed.
-
-| Guard | What it does |
-|-------|-------------|
-| `text-only` | Only text messages allowed — blocks images, videos, stickers, voice notes |
-| `media-only` | Only media allowed — blocks plain text messages |
-| `video-only` | Only video messages allowed |
-| `voice-only` | Only voice notes allowed |
-| `no-images` | Blocks images and photos |
+| Guard | Behavior |
+|---|---|
+| `no-spam` | Blocks rapid messages above a configured count and window |
+| `slow-mode` | Limits each member to one message per interval |
+| `quiet-hours` | Blocks messages during configured hours |
+| `approved-senders` | Allows only named WhatsApp JIDs |
+| `no-links` | Blocks URLs |
+| `no-forwarded` | Blocks forwarded messages |
+| `max-text-length` | Blocks text above a configured length |
+| `keyword-filter` | Blocks configured words; regular expressions require a local opt-in |
+| `text-only` | Allows text and blocks media |
+| `media-only` | Allows media and blocks plain text |
+| `video-only` | Allows video messages |
+| `voice-only` | Allows voice notes |
+| `no-images` | Blocks images |
 | `no-stickers` | Blocks stickers |
 
-### Content Property Guards
+Admins remain exempt unless an operator changes that setting. Keep the exemption on for the first enforcement period.
 
-Filter messages based on their *content*.
+## Optional Claude agent
 
-| Guard | What it does |
-|-------|-------------|
-| `no-links` | Blocks any message containing a URL |
-| `no-forwarded` | Blocks forwarded messages — only original content allowed |
-| `max-text-length` | Blocks messages longer than a limit (default: 2000 characters) |
-| `keyword-filter` | Blocks messages matching specific words or regex patterns — configure your own blocklist |
+The agent can answer mentions, schedule tasks, browse the web, and manage group files. It processes untrusted messages, so GroupGuard keeps it off by default.
 
-### Behavioral Guards
+To enable it:
 
-Rate limiting and access control.
+1. Install and start Docker.
+2. Add `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` to `.env`.
+3. Set `GROUPGUARD_AGENT_ENABLED=true`.
+4. Build the agent image with `./container/build.sh`.
+5. Run `npm run doctor`.
 
-| Guard | What it does |
-|-------|-------------|
-| `no-spam` | Blocks rapid-fire messages — more than 5 messages in 10 seconds triggers it |
-| `slow-mode` | Limits users to one message every N minutes (default: 5) |
-| `quiet-hours` | Blocks messages during set hours (default: 10pm–7am) |
-| `approved-senders` | Whitelist mode — only approved users can send messages |
+The main agent receives a read-only project mount. Set `GROUPGUARD_AGENT_PROJECT_WRITE_ENABLED=true` only for a short, supervised maintenance session.
 
-All guards are configurable. Defaults are sensible, but you can tune thresholds, time windows, keyword lists, and approved users per group.
+## Where to run it
 
-### How Enforcement Works
+Use your computer for setup and a short observation test. For 24/7 operation, use a dedicated low-privilege VM with encrypted storage and a service supervisor. Do not run production and test instances against the same `store/auth` directory or WhatsApp number.
 
-```
-Message arrives → Is sender an admin? → Yes: skip (admins are exempt)
-                                      → No: run guards
-                                              → All pass: message stays
-                                              → Guard blocks: delete + DM sender with reason
-```
+Recommended account layout:
 
-**Observation mode** lets you test rules without deleting — violations get logged but messages stay. **DM cooldown** prevents notification spam (one DM per user per 60 seconds). Everything is logged to SQLite.
+| Purpose | Number | Runtime |
+|---|---|---|
+| Initial test | Separate test number | Your computer, foreground process |
+| 24/7 moderation | Dedicated moderation number | Dedicated VM, systemd |
+| Development | Another test number | Separate state directory |
 
-## Usage
-
-Talk to your bot with the trigger word (default: `@GroupGuard`):
-
-```
-@GroupGuard enable no-spam for this group
-@GroupGuard show me the last 10 moderation violations
-@GroupGuard schedule a daily summary at 9am
-@GroupGuard remind me every Monday to check group stats
-```
-
-From the admin channel, you control everything:
-
-```
-@GroupGuard list all groups and their guard configs
-@GroupGuard enable observation mode for Work Team
-@GroupGuard register the "Family Chat" group
-```
-
-## Customizing
-
-Tell Claude Code what you want:
-
-- "Add a guard that blocks messages with more than 3 emojis"
-- "Change the DM message when a message is blocked"
-- "Add a daily moderation report to the admin group"
-
-Or run `/customize` for guided changes. The codebase is small enough that Claude can safely modify it.
-
-## Deploying
-
-Works locally or on a server. See the [deployment guide](docs/DEPLOYMENT.md) for Hetzner, DigitalOcean, and other options starting at $4/month.
+See [Deployment](docs/DEPLOYMENT.md) for service setup.
 
 ## Architecture
 
-Single Node.js process. Guards run on the host for instant enforcement. Agent responses run in isolated Docker containers. Per-group message queues. Full details in [docs/SPEC.md](docs/SPEC.md).
+One Node.js process handles the WhatsApp connection, local guards, SQLite audit data, action budgets, and reconnection. Optional agent work runs in ephemeral Docker containers. Each group gets an isolated folder and session.
+
+This keeps the moderation path independent from AI availability and makes the default installation small enough to inspect.
 
 ## License
 

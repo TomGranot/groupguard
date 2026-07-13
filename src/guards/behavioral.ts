@@ -25,19 +25,25 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
-function getKey(chatJid: string, senderJid: string): string {
-  return `${chatJid}:${senderJid}`;
+function getKey(guardId: string, chatJid: string, senderJid: string): string {
+  return `${guardId}:${chatJid}:${senderJid}`;
 }
 
-function recordMessage(chatJid: string, senderJid: string, now: number): void {
-  const key = getKey(chatJid, senderJid);
+function recordMessage(guardId: string, chatJid: string, senderJid: string, now: number): void {
+  const key = getKey(guardId, chatJid, senderJid);
   const times = messageTimes.get(key) || [];
   times.push(now);
   messageTimes.set(key, times);
 }
 
-function getRecentCount(chatJid: string, senderJid: string, windowMs: number, now: number): number {
-  const key = getKey(chatJid, senderJid);
+function getRecentCount(
+  guardId: string,
+  chatJid: string,
+  senderJid: string,
+  windowMs: number,
+  now: number,
+): number {
+  const key = getKey(guardId, chatJid, senderJid);
   const times = messageTimes.get(key) || [];
   const cutoff = now - windowMs;
   return times.filter((t) => t > cutoff).length;
@@ -75,8 +81,8 @@ export const slowModeGuard: Guard = {
     const windowMs = intervalMinutes * 60 * 1000;
     const now = ctx.now.getTime();
 
-    const recentCount = getRecentCount(ctx.chatJid, ctx.senderJid, windowMs, now);
-    recordMessage(ctx.chatJid, ctx.senderJid, now);
+    const recentCount = getRecentCount('slow-mode', ctx.chatJid, ctx.senderJid, windowMs, now);
+    recordMessage('slow-mode', ctx.chatJid, ctx.senderJid, now);
 
     if (recentCount >= 1) {
       return block('slow-mode', `Slow mode is active. You can send 1 message every ${intervalMinutes} minutes.`);
@@ -95,8 +101,8 @@ export const noSpamGuard: Guard = {
     const windowMs = windowSeconds * 1000;
     const now = ctx.now.getTime();
 
-    const recentCount = getRecentCount(ctx.chatJid, ctx.senderJid, windowMs, now);
-    recordMessage(ctx.chatJid, ctx.senderJid, now);
+    const recentCount = getRecentCount('no-spam', ctx.chatJid, ctx.senderJid, windowMs, now);
+    recordMessage('no-spam', ctx.chatJid, ctx.senderJid, now);
 
     if (recentCount >= maxMessages) {
       return block('no-spam', `You're sending messages too quickly. Max ${maxMessages} messages per ${windowSeconds} seconds.`);
