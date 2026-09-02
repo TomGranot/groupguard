@@ -164,6 +164,8 @@ One Node.js process handles the WhatsApp connection, local guards, SQLite audit 
 
 This keeps the moderation path independent from AI availability and makes the default installation small enough to inspect.
 
+Proposed extension: [Semantic directory assistant](docs/RFC-SEMANTIC-DIRECTORY-ASSISTANT.md), a design for group-scoped service-provider replies with local classification and reviewed recommendation evidence. The RFC contains no implementation.
+
 ## License
 
 MIT
