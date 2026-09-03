@@ -42,6 +42,7 @@ import { isSafeAttachmentName } from '../attachment-safety.js';
 import { DATA_DIR } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { GroupGuardService } from '../groupguard/bootstrap.js';
+import { ReconnectBudget } from '../groupguard/reliability/reconnect.js';
 import { log } from '../log.js';
 import { decideWhatsAppIngress, parseAllowedWhatsAppGroups } from '../groupguard/ingress.js';
 import { registerChannelAdapter } from './channel-registry.js';
@@ -107,7 +108,7 @@ const AUTH_DIR = path.join(process.cwd(), 'store', 'auth');
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
 const GROUP_METADATA_CACHE_TTL_MS = 60_000; // 1 min for outbound sends
 const SENT_MESSAGE_CACHE_MAX = 256;
-const RECONNECT_DELAY_MS = 5000;
+const RECONNECT_STABLE_MS = 60_000;
 const PENDING_QUESTIONS_MAX = 64;
 
 /** Normalize an option label to a slash command: "Approve" → "/approve" */
@@ -415,6 +416,9 @@ registerChannelAdapter('whatsapp', {
       'GROUPGUARD_ALLOWED_GROUPS',
       'GROUPGUARD_CONFIG_PATH',
       'GROUPGUARD_ENFORCEMENT_ENABLED',
+      'GROUPGUARD_RECONNECT_MAX_ATTEMPTS',
+      'GROUPGUARD_RECONNECT_BASE_DELAY_MS',
+      'GROUPGUARD_RECONNECT_MAX_DELAY_MS',
     ]);
     const phoneNumber = env.WHATSAPP_PHONE_NUMBER;
     const authDir = AUTH_DIR;
@@ -432,6 +436,13 @@ registerChannelAdapter('whatsapp', {
     let shuttingDown = false;
     let setupConfig: ChannelSetup;
     let groupGuardService: GroupGuardService | undefined;
+    let reconnectTimer: NodeJS.Timeout | undefined;
+    let stableConnectionTimer: NodeJS.Timeout | undefined;
+    const reconnectBudget = new ReconnectBudget({
+      maxAttempts: Number(env.GROUPGUARD_RECONNECT_MAX_ATTEMPTS || 8),
+      baseDelayMs: Number(env.GROUPGUARD_RECONNECT_BASE_DELAY_MS || 1_000),
+      maxDelayMs: Number(env.GROUPGUARD_RECONNECT_MAX_DELAY_MS || 60_000),
+    });
 
     // LID → phone JID mapping (WhatsApp's new ID system)
     const lidToPhoneMap: Record<string, string> = {};
@@ -473,6 +484,25 @@ registerChannelAdapter('whatsapp', {
     const pairingCodeFile = path.join(process.cwd(), 'store', 'pairing-code.txt');
 
     // --- Helpers ---
+
+    function scheduleReconnect(): void {
+      if (shuttingDown || reconnectTimer) return;
+      const decision = reconnectBudget.next();
+      if (!decision.allowed) {
+        log.error('WhatsApp reconnect budget exhausted; operator action is required', {
+          attempts: decision.attempt,
+        });
+        return;
+      }
+      log.warn('Scheduling WhatsApp reconnect', { attempt: decision.attempt, delayMs: decision.delayMs });
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = undefined;
+        connectSocket().catch((error) => {
+          log.error('WhatsApp reconnect attempt failed', { error });
+          scheduleReconnect();
+        });
+      }, decision.delayMs);
+    }
 
     function setLidPhoneMapping(lidUser: string, phoneJid: string): void {
       if (lidToPhoneMap[lidUser] === phoneJid) return;
@@ -726,6 +756,10 @@ registerChannelAdapter('whatsapp', {
 
         if (connection === 'close') {
           connected = false;
+          if (stableConnectionTimer) {
+            clearTimeout(stableConnectionTimer);
+            stableConnectionTimer = undefined;
+          }
           const reason = (lastDisconnect?.error as { output?: { statusCode?: number } })?.output?.statusCode;
           // Don't auto-reconnect during shutdown — a parallel connectSocket()
           // initializes useMultiFileAuthState which can truncate creds.json
@@ -736,15 +770,7 @@ registerChannelAdapter('whatsapp', {
           log.info('WhatsApp connection closed', { reason, shouldReconnect, shuttingDown });
 
           if (shouldReconnect) {
-            log.info('Reconnecting...');
-            connectSocket().catch((err) => {
-              log.error('Failed to reconnect, retrying in 5s', { err });
-              setTimeout(() => {
-                connectSocket().catch((err2) => {
-                  log.error('Reconnection retry failed', { err: err2 });
-                });
-              }, RECONNECT_DELAY_MS);
-            });
+            scheduleReconnect();
           } else if (reason === DisconnectReason.loggedOut) {
             // Server-side logout (account unlinked, 401, etc.). Clear auth so
             // the next start prompts for a fresh pair — stale creds would
@@ -778,6 +804,15 @@ registerChannelAdapter('whatsapp', {
           }
         } else if (connection === 'open') {
           connected = true;
+          if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = undefined;
+          }
+          stableConnectionTimer = setTimeout(() => {
+            reconnectBudget.reset();
+            stableConnectionTimer = undefined;
+            log.info('WhatsApp connection remained stable; reconnect budget reset');
+          }, RECONNECT_STABLE_MS);
           log.info('Connected to WhatsApp');
 
           // Clean up pairing code file after successful connection
@@ -1172,6 +1207,8 @@ registerChannelAdapter('whatsapp', {
       async teardown() {
         shuttingDown = true;
         connected = false;
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        if (stableConnectionTimer) clearTimeout(stableConnectionTimer);
         groupGuardService?.close();
         sock?.end(undefined);
         log.info('WhatsApp adapter shut down');
