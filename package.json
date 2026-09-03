@@ -1,38 +1,61 @@
 {
-  "name": "groupguard",
-  "version": "0.1.0",
-  "description": "Safety-first WhatsApp group moderation with an optional Claude agent.",
+  "name": "nanoclaw",
+  "version": "2.3.0",
+  "description": "Personal AI assistant. Lightweight, secure, customizable.",
   "type": "module",
+  "packageManager": "pnpm@10.34.5",
   "main": "dist/index.js",
+  "bin": {
+    "ncl": "bin/ncl"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "auth": "tsx src/whatsapp-auth.ts",
-    "groups": "tsx src/configure-groups.ts",
-    "enforcement": "tsx src/enforcement-cli.ts",
-    "playground": "tsx src/playground-cli.ts",
-    "doctor": "tsx src/doctor.ts",
-    "test": "node --import tsx --test tests/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "mailbox-model:generate": "cp src/mailbox/model.ts container/agent-runner/src/mailbox/model.generated.ts",
+    "mailbox-model:check": "cmp src/mailbox/model.ts container/agent-runner/src/mailbox/model.generated.ts",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "format:fix": "prettier --write \"src/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\"",
+    "stdin-json:generate": "sh scripts/sync-stdin-json.sh",
+    "stdin-json:check": "sh scripts/sync-stdin-json.sh --check",
+    "prepare": "husky",
+    "setup": "tsx setup/index.ts",
+    "setup:auto": "tsx setup/auto.ts",
+    "ncl": "tsx src/cli/client.ts",
+    "migrate": "tsx scripts/migrate.ts",
+    "chat": "tsx scripts/chat.ts",
+    "lint": "eslint src/",
+    "lint:fix": "eslint src/ --fix",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "7.0.0-rc13",
-    "better-sqlite3": "12.11.1",
-    "cron-parser": "^5.5.0",
-    "pino": "^9.6.0",
-    "pino-pretty": "^13.0.0",
-    "qrcode-terminal": "^0.12.0",
-    "zod": "^4.3.6"
+    "@clack/core": "^1.2.0",
+    "@clack/prompts": "^1.2.0",
+    "@onecli-sh/sdk": "2.2.1",
+    "better-sqlite3": "13.0.3",
+    "chat": "4.29.0",
+    "cron-parser": "5.5.0",
+    "kleur": "^4.1.5",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
+    "@eslint/js": "^9.35.0",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.0",
-    "@types/qrcode-terminal": "^0.12.2",
+    "eslint": "^9.35.0",
+    "eslint-plugin-no-catch-all": "^1.1.0",
+    "globals": "^15.12.0",
+    "husky": "^9.1.7",
+    "prettier": "^3.8.1",
     "tsx": "^4.19.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.35.0",
+    "vitest": "^4.0.18"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   }
 }

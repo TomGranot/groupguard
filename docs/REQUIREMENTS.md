@@ -1,18 +1,6 @@
-# GroupGuard Requirements
+# NanoClaw Requirements
 
 Original requirements and design decisions from the project creator.
-
----
-
-## Current Product Priorities
-
-These priorities supersede older setup and runtime assumptions in this document:
-
-1. A new operator can install, link WhatsApp, select groups, and validate the runtime through one guided command.
-2. The moderation core works without Docker, Claude, or an API key.
-3. New groups observe first. Consequential actions require a local operator gate, verified metadata, durable deduplication, action budgets, and bounded retries.
-4. Documentation recommends a separate WhatsApp number, a local foreground test, and a dedicated low-privilege VM for continuous operation.
-5. Optional agent capabilities stay disabled and read-only until the operator enables them.
 
 ---
 
@@ -20,7 +8,7 @@ These priorities supersede older setup and runtime assumptions in this document:
 
 This is a lightweight, secure alternative to OpenClaw (formerly ClawBot). That project became a monstrosity - 4-5 different processes running different gateways, endless configuration files, endless integrations. It's a security nightmare where agents don't run in isolated processes; there's all kinds of leaky workarounds trying to prevent them from accessing parts of the system they shouldn't. It's impossible for anyone to realistically understand the whole codebase. When you run it you're kind of just yoloing it.
 
-GroupGuard gives you the core functionality without that mess.
+NanoClaw gives you the core functionality without that mess.
 
 ---
 
@@ -32,19 +20,21 @@ The entire codebase should be something you can read and understand. One Node.js
 
 ### Security Through True Isolation
 
-Instead of application-level permission systems trying to prevent agents from accessing things, agents run in actual Linux containers (Docker). The isolation is at the OS level. Agents can only see what's explicitly mounted. Bash access is safe because commands run inside the container, not on your host.
+Instead of application-level permission systems trying to prevent agents from accessing things, agents run in actual Linux containers. The isolation is at the OS level. Agents can only see what's explicitly mounted. Bash access is safe because commands run inside the container, not on your host.
 
-### Built for One User
+### Built for the Individual User
 
-This isn't a framework or a platform. It's working software for my specific needs. I use WhatsApp and Email, so it supports WhatsApp and Email. I don't use Telegram, so it doesn't support Telegram. I add the integrations I actually want, not every possible integration.
+This isn't a framework or a platform. It's software that fits each user's exact needs. You fork the repo, add the channels you want (WhatsApp, Telegram, Discord, Slack, Gmail), and end up with clean code that does exactly what you need.
 
 ### Customization = Code Changes
 
 No configuration sprawl. If you want different behavior, modify the code. The codebase is small enough that this is safe and practical. Very minimal things like the trigger word are in config. Everything else - just change the code to do what you want.
 
-### CLI-First Operations
+### AI-Native Development
 
-Setup and diagnostics must work without an AI collaborator. `./setup.sh` owns first-run onboarding and `npm run doctor` checks the installation. Claude can help with customization after the moderation core works.
+I don't need an installation wizard - Claude Code guides the setup. I don't need a monitoring dashboard - I ask Claude Code what's happening. I don't need elaborate logging UIs - I ask Claude to read the logs. I don't need debugging tools - I describe the problem and Claude fixes it.
+
+The codebase assumes you have an AI collaborator. It doesn't need to be excessively self-documenting or self-debugging because Claude is always there.
 
 ### Skills Over Features
 
@@ -54,37 +44,31 @@ When people contribute, they shouldn't add "Telegram support alongside WhatsApp.
 
 ## RFS (Request for Skills)
 
-Skills we'd love contributors to build:
+Skills we'd like to see contributed:
 
 ### Communication Channels
-Skills to add or switch to different messaging platforms:
-- `/add-telegram` - Add Telegram as an input channel
-- `/add-slack` - Add Slack as an input channel
-- `/add-discord` - Add Discord as an input channel
-- `/add-sms` - Add SMS via Twilio or similar
-- `/convert-to-telegram` - Replace WhatsApp with Telegram entirely
 
-### Platform Support
-- `/setup-windows` - Windows support via WSL2 + Docker
+None currently — Signal and Matrix have since shipped as skills.
+
+> **Note:** Telegram, Slack, Discord, Gmail, Signal, and Matrix skills already exist. See the [skills documentation](https://docs.nanoclaw.dev/integrations/skills-system) for the full list.
 
 ---
 
 ## Vision
 
-A personal Claude assistant accessible via WhatsApp, with minimal custom code.
+A personal AI assistant accessible via messaging, with minimal custom code.
 
 **Core components:**
-- **Local guard engine** as the default moderation path
-- **Claude Agent SDK** as an optional agent
-- **Docker** for isolated agent execution (Linux containers)
-- **WhatsApp** as the primary I/O channel
+- **Claude Agent SDK** as the core agent
+- **Containers** for isolated agent execution (Docker)
+- **Multi-channel messaging** (WhatsApp, Telegram, Discord, Slack, Gmail) — add exactly the channels you need
 - **Persistent memory** per conversation and globally
-- **Scheduled tasks** that run Claude and can message back
+- **Scheduled tasks** executed by the agent, which can message back
 - **Web access** for search and browsing
 - **Browser automation** via agent-browser
 
 **Implementation approach:**
-- Use existing tools (WhatsApp connector, Claude Agent SDK, MCP servers)
+- Use existing tools (channel libraries, Claude Agent SDK, MCP servers)
 - Minimal glue code
 - File-based systems where possible (CLAUDE.md for memory, folders for groups)
 
@@ -93,9 +77,9 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 ## Architecture Decisions
 
 ### Message Routing
-- A router listens to WhatsApp and routes messages based on configuration
+- A router listens to connected channels and routes messages based on configuration
 - Only messages from registered groups are processed
-- Trigger: `@GroupGuard` prefix (case insensitive), configurable via `ASSISTANT_NAME` env var
+- Trigger: `@Andy` prefix (case insensitive), configurable via `ASSISTANT_NAME` env var
 - Unregistered groups are ignored completely
 
 ### Memory System
@@ -109,14 +93,14 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 - Sessions auto-compact when context gets too long, preserving critical information
 
 ### Container Isolation
-- Optional agents run inside Docker containers
+- All agents run inside Docker containers
 - Each agent invocation spawns a container with mounted directories
 - Containers provide filesystem isolation - agents can only see mounted paths
 - Bash access is safe because commands run inside the container, not on the host
 - Browser automation via agent-browser with Chromium in the container
 
 ### Scheduled Tasks
-- Users can ask Claude to schedule recurring or one-time tasks from any group
+- Users can ask the agent to schedule recurring or one-time tasks from any group
 - Tasks run as full agents in the context of the group that created them
 - Tasks have access to all tools including Bash (safe in container)
 - Tasks can optionally send messages to their group via `send_message` tool, or complete silently
@@ -127,7 +111,7 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 
 ### Group Management
 - New groups are added explicitly via the main channel
-- Groups are registered by editing `data/registered_groups.json`
+- Groups are registered in SQLite (via the main channel or IPC `register_group` command)
 - Each group gets a dedicated folder under `groups/`
 - Groups can have additional directories mounted via `containerConfig`
 
@@ -142,18 +126,19 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 
 ## Integration Points
 
-### WhatsApp
-- Using baileys library for WhatsApp Web connection
+### Channels
+- WhatsApp (baileys), Telegram (grammy), Discord (discord.js), Slack (@slack/bolt), Gmail (googleapis)
+- Each channel lives in a separate fork repo and is added via skills (e.g., `/add-whatsapp`, `/add-telegram`)
 - Messages stored in SQLite, polled by router
-- QR code authentication during setup
+- Channels self-register at startup — unconfigured channels are skipped with a warning
 
 ### Scheduler
 - Built-in scheduler runs on the host, spawns containers for task execution
-- Custom `groupguard` MCP server (inside container) provides scheduling tools
-- Tools: `schedule_task`, `list_tasks`, `pause_task`, `resume_task`, `cancel_task`, `send_message`
+- `ncl tasks` provides scheduling commands
+- Commands: `list`, `get`, `create`, `update`, `cancel`, `pause`, `resume`, `delete`, `run`, `append-log`
 - Tasks stored in SQLite with run history
 - Scheduler loop checks for due tasks every minute
-- Tasks execute Claude Agent SDK in containerized group context
+- Tasks execute in the agent group's system session
 
 ### Web Access
 - Built-in WebSearch and WebFetch tools
@@ -171,19 +156,18 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 
 ### Philosophy
 - Minimal configuration files
-- Guided setup and diagnostics work from the terminal
-- Claude Code remains optional for customization
+- Setup and customization done via Claude Code
+- Users clone the repo and run Claude Code to configure
 - Each user gets a custom setup matching their exact needs
 
 ### Skills
-- `/setup` - Install dependencies, authenticate WhatsApp, configure scheduler, start services
-- `/customize` - General-purpose skill for adding capabilities (new channels like Telegram, new integrations, behavior changes)
+- `/setup` - Install dependencies, configure channels, start services
+- `/customize` - General-purpose skill for adding capabilities
+- `/update-nanoclaw` - Pull upstream changes, merge with customizations
 
 ### Deployment
-- macOS: runs via launchd service
-- Linux: runs via systemd service
+- Runs on macOS (launchd), Linux (systemd), or Windows (WSL2)
 - Single Node.js process handles everything
-- Moderation-only deployment does not require Docker
 
 ---
 
@@ -191,8 +175,8 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 
 These are the creator's settings, stored here for reference:
 
-- **Trigger**: `@GroupGuard` (case insensitive)
-- **Response prefix**: `GroupGuard:`
+- **Trigger**: `@Andy` (case insensitive)
+- **Response prefix**: `Andy:`
 - **Persona**: Default Claude (no custom personality)
 - **Main channel**: Self-chat (messaging yourself in WhatsApp)
 
@@ -200,4 +184,4 @@ These are the creator's settings, stored here for reference:
 
 ## Project Name
 
-**GroupGuard** - A reference to Clawdbot (now OpenClaw).
+**NanoClaw** - A reference to Clawdbot (now OpenClaw).

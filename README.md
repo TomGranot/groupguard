@@ -1,169 +1,250 @@
-<h1 align="center">GroupGuard</h1>
-<p align="center">Safety-first moderation for WhatsApp groups</p>
-
 <p align="center">
-  <img src="assets/groupguard-banner.png" alt="GroupGuard" width="600">
+  <img src="assets/nanoclaw-logo.png" alt="NanoClaw" width="400">
 </p>
 
 <p align="center">
-  <a href="https://groupguard.granot.io">Website</a> &middot;
-  <a href="docs/PLAYGROUND.md">Playground</a> &middot;
-  <a href="docs/SAFE-OPERATIONS.md">Safe operations</a> &middot;
-  <a href="docs/DEPLOYMENT.md">Deploy</a> &middot;
-  <a href="docs/SPEC.md">Architecture</a>
+  An AI assistant that runs agents securely in their own containers. Lightweight, built to be easily understood and completely customized for your needs.
 </p>
 
-GroupGuard watches selected WhatsApp groups, evaluates local rules, and records violations. It starts in observation mode. Deletions require a 24-hour observation period, a per-group setting, and an operator-side lock outside WhatsApp.
+<p align="center">
+  <a href="https://nanoclaw.dev">nanoclaw.dev</a>&nbsp; • &nbsp;
+  <a href="https://docs.nanoclaw.dev">docs</a>&nbsp; • &nbsp;
+  <a href="README_zh.md">中文</a>&nbsp; • &nbsp;
+  <a href="README_ja.md">日本語</a>&nbsp; • &nbsp;
+  <a href="README_ko.md">한국어</a>&nbsp; • &nbsp;
+  <a href="https://discord.gg/VDdww8qS42"><img src="https://img.shields.io/discord/1470188214710046894?label=Discord&logo=discord&v=2" alt="Discord" valign="middle"></a>&nbsp; • &nbsp;
+  <a href="repo-tokens"><img src="repo-tokens/badge.svg" alt="repo tokens" valign="middle"></a>
+</p>
 
-The moderation core needs Node.js and a linked WhatsApp account. Docker, Claude, and API credentials are optional.
+---
 
-> [!WARNING]
-> GroupGuard uses WhatsApp's unofficial linked-device protocol because Meta's official API does not expose group moderation. WhatsApp may restrict automated accounts. Use a separate number that you can afford to lose.
+<div align="center">
 
-## Quick start
+### <img src="https://img.shields.io/badge/NEW!-2EB67D?style=for-the-badge" alt="NEW!" valign="middle"> Agents in Slack: one app per agent <img src="assets/slack-icon.svg" alt="" width="22" valign="middle">
 
-Requirements: Node.js 20 or newer and a WhatsApp account.
+Setup provisions each agent its own Slack app: manifest, avatar, and workspace install, no tokens to paste.
+Spawn teammates from chat: every one gets its own bot identity, container, and memory, with shared rooms and canvases.
 
-```bash
-git clone https://github.com/TomGranot/groupguard.git
-cd groupguard
-./setup.sh
-```
+[![Quick Start](https://img.shields.io/badge/Quick%20Start%20%E2%86%92-4A154B?style=for-the-badge)](#quick-start)
 
-Setup installs pinned dependencies, links WhatsApp, lists your groups, writes conservative settings, builds the app, and runs diagnostics.
+</div>
 
-Start it in the foreground for the first test:
+---
 
-```bash
-npm start
-```
+## Why I Built NanoClaw
 
-Useful commands:
+[OpenClaw](https://github.com/openclaw/openclaw) is an impressive project, but I wouldn't have been able to sleep if I had given complex software I didn't understand full access to my life. OpenClaw has nearly half a million lines of code, 53 config files, and 70+ dependencies. Its security is at the application level (allowlists, pairing codes) rather than true OS-level isolation. Everything runs in one Node process with shared memory.
 
-```bash
-npm run groups                 # Add groups
-npm run doctor                 # Validate auth, config, permissions, and runtime
-npm run enforcement -- status # Show each group's mode
-npm run playground -- status  # Inspect the public demo profile
-npm test                       # Run safety tests
-```
+NanoClaw provides that same core functionality, but in a codebase small enough to understand: one process and a handful of files. Agents run in their own Linux containers with filesystem isolation, not merely behind permission checks.
 
-## Try before setup
-
-A public **GroupGuard Playground** can make the first product experience a WhatsApp group instead of an installation guide. Visitors run one of four fixed commands, see a simulated guard decision, and can continue to **Protect my group**.
-
-The sealed playground profile requires a dedicated number and installation. It disables AI, enforcement, DMs, and typing indicators; accepts no free-form prompts; rate-limits responses; and deduplicates commands by message ID.
-
-Read [GroupGuard Playground](docs/PLAYGROUND.md) for the welcome copy, deployment steps, safety boundary, and launch checklist.
-
-### Existing installations
-
-Back up `data` and `store`, pull the update, then run `npm ci`, `npm run build`, and `npm run doctor`. The upgrade disables the optional agent and closes the enforcement lock unless `.env` enables them. Existing raw regex filters also need the local `GROUPGUARD_ALLOW_REGEX_FILTERS=true` opt-in.
-
-## Defaults that protect the account
-
-- Observation mode for every new group
-- One starter guard: `no-spam`
-- No deletion until the operator unlocks enforcement
-- No unsolicited moderation DMs
-- Admins exempt from guards
-- No enforcement when the admin list cannot be verified
-- Durable deduplication for moderation actions
-- Per-account action budgets and a failure circuit breaker
-- Bounded reconnect attempts with exponential backoff and jitter
-- AI agent disabled
-- Agent project access read-only when the agent is enabled
-
-GroupGuard favors a missed action over repeated or uncertain account mutations.
-
-## Moving from observation to enforcement
-
-Leave a new group in observation mode for at least 24 hours. Review its log before enabling deletions:
+## Quick Start
 
 ```bash
-sqlite3 store/messages.db \
-  "SELECT timestamp, guard_id, reason FROM moderation_log ORDER BY timestamp DESC LIMIT 50"
+git clone https://github.com/nanocoai/nanoclaw.git nanoclaw-v2
+cd nanoclaw-v2
+bash nanoclaw.sh
 ```
 
-List folder names, then enable one group:
+`nanoclaw.sh` walks you from a fresh machine to a named agent you can message. It installs Node, pnpm, and Docker if missing, registers your Anthropic credential with OneCLI, builds the agent container, and pairs your first channel (Slack, Telegram, Discord, WhatsApp, iMessage, or a local CLI). If a step fails, Claude Code is invoked automatically to diagnose and resume from where it broke.
+
+<details>
+<summary><strong>Migrating from NanoClaw v1?</strong></summary>
+
+Run from a fresh v2 checkout next to your v1 install:
 
 ```bash
-npm run enforcement -- status
-npm run enforcement -- enable family-chat
+git clone https://github.com/nanocoai/nanoclaw.git nanoclaw-v2
+cd nanoclaw-v2
+bash migrate-v2.sh
 ```
 
-The command refuses early activation, opens the operator lock in `.env`, and changes only the named group. Restart GroupGuard and verify the result:
+`migrate-v2.sh` finds your v1 install (sibling directory, or `NANOCLAW_V1_PATH=/path/to/nanoclaw`), migrates state into the v2 checkout, then `exec`s into Claude Code to finish the parts that need judgment (owner seeding, shared-memory migration, fork-customisation replay).
 
-```bash
-npm run doctor
-npm start
+Run the script directly, not from inside a Claude session — the deterministic side needs interactive prompts and real shell I/O for Node/pnpm bootstrap, Docker, OneCLI, and the container build.
+
+**What it does:** merges `.env`, seeds the v2 DB from `registered_groups`, copies group folders + session data + scheduled tasks, installs the channel adapters you select, copies channel auth state (including the Baileys keystore for WhatsApp — LID mapping is now resolved per-message by the Baileys v7 adapter, not migrated), builds the agent container.
+
+**What it doesn't:** flip the system service. Pick *"switch to v2"* at the prompt, or do it manually after testing — your v1 install is left untouched.
+
+See [docs/v1-to-v2-changes.md](docs/v1-to-v2-changes.md) for what's different and [docs/migration-dev.md](docs/migration-dev.md) for development notes.
+
+</details>
+
+## Philosophy
+
+**Small enough to understand.** One process, a few source files and no microservices. If you want to understand the full NanoClaw codebase, just ask Claude Code to walk you through it.
+
+**Secure by isolation.** Agents run in Linux containers and they can only see what's explicitly mounted. Bash access is safe because commands run inside the container, not on your host.
+
+**Built for the individual user.** NanoClaw isn't a monolithic framework; it's software that fits each user's exact needs. Instead of becoming bloatware, NanoClaw is designed to be bespoke. You make your own fork and have Claude Code modify it to match your needs.
+
+**Customization = code changes.** No configuration sprawl. Want different behavior? Modify the code. The codebase is small enough that it's safe to make changes.
+
+**AI-native, hybrid by design.** The install and onboarding flow is an optimized scripted path, fast and deterministic. When a step needs judgment, whether a failed install, a guided decision, or a customization, control hands off to Claude Code seamlessly. Beyond setup there's no monitoring dashboard or debugging UI either: describe the problem in chat and Claude Code handles it.
+
+**Skills over features.** Trunk ships the registry and infrastructure, not specific channel adapters or alternative agent providers. Channels (Discord, Slack, Telegram, WhatsApp, …) live on a long-lived `channels` branch; alternative providers (OpenCode, Ollama) live on `providers`. You run `/add-telegram`, `/add-opencode`, etc. and the skill copies exactly the module(s) you need into your fork. No feature you didn't ask for.
+
+**Best harness, best model.** NanoClaw natively uses Claude Code via Anthropic's official Claude Agent SDK, so you get the latest Claude models and Claude Code's full toolset, including the ability to modify and expand your own NanoClaw fork. Other providers are drop-in options: `/add-codex` for OpenAI's Codex (ChatGPT subscription or API key), `/add-opencode` for OpenRouter, Google, DeepSeek and more via OpenCode, and `/add-ollama-provider` for local open-weight models. Provider is configurable per agent group.
+
+## What It Supports
+
+- **Multi-channel messaging** — WhatsApp, Telegram, Discord, Slack, Microsoft Teams, iMessage, Matrix, Google Chat, Webex, Linear, GitHub, WeChat, and email via Resend. Installed on demand with `/add-<channel>` skills. Run one or many at the same time.
+- **Flexible isolation** — connect each channel to its own agent for full privacy, share one agent across many channels for unified memory with separate conversations, or fold multiple channels into a single shared session so one conversation spans many surfaces. Pick per channel via `/manage-channels`. See [docs/isolation-model.md](docs/isolation-model.md).
+- **Per-agent workspace** — each agent group has its own `CLAUDE.md`, its own memory, its own container, and only the mounts you allow. Nothing crosses the boundary unless you wire it to.
+- **Scheduled tasks**: recurring jobs executed by the agent, with optional [script gates](docs/scheduled-tasks.md) that avoid waking it when there is no work
+- **Web access** — search and fetch content from the web
+- **Container isolation** — agents are sandboxed in Docker containers (macOS/Linux/WSL2)
+- **Credential security** — agents never hold raw API keys. Outbound requests route through [OneCLI's Agent Vault](https://github.com/onecli/onecli), which injects credentials at request time and enforces per-agent policies and rate limits.
+- **Agent templates**: stamp a ready-to-run agent (instructions + MCP tools + skills, no secrets) from a reusable bundle via `ncl groups create --template <ref>`. Templates load from the local `templates/` folder; populate it by hand or by copying from the [public library](https://github.com/nanocoai/nanoclaw-templates). See [docs/templates.md](docs/templates.md).
+
+## Accounts and what leaves your machine
+
+NanoClaw has no user accounts. The only thing it reports is anonymous setup diagnostics, and
+`NANOCLAW_NO_DIAGNOSTICS=1` turns those off. Your agents, messages, files and keys never leave
+your machine.
+
+One opt-in exception: you can [fetch a prebuilt agent image](docs/hardened-image.md) instead of
+building it locally. Fetching ours needs a free account, so we see your email address and when
+you ask for an image — nothing about your agents, and nothing after the image lands. Building
+locally needs no account and contacts nothing, and is the default.
+
+## Usage
+
+Talk to your assistant with the trigger word (default: `@Andy`):
+
+```
+@Andy send an overview of the sales pipeline every weekday morning at 9am (has access to my Obsidian vault folder)
+@Andy review the git history for the past week each Friday and update the README if there's drift
+@Andy every Monday at 8am, compile news on AI developments from Hacker News and TechCrunch and message me a briefing
 ```
 
-Return to observation mode at any time:
-
-```bash
-npm run enforcement -- disable family-chat
+From a channel you own or administer, you can manage groups and tasks:
+```
+@Andy list all scheduled tasks across groups
+@Andy pause the Monday briefing task
+@Andy join the Family Chat group
 ```
 
-Read [Safe Operations](docs/SAFE-OPERATIONS.md) before enabling enforcement.
+## Customizing
 
-## Guards
+NanoClaw doesn't use configuration files. To make changes, just tell Claude Code what you want:
 
-Each group has its own guard list and thresholds.
+- "Change the trigger word to @Bob"
+- "Remember in the future to make responses shorter and more direct"
+- "Add a custom greeting when I say good morning"
+- "Store conversation summaries weekly"
 
-| Guard | Behavior |
-|---|---|
-| `no-spam` | Blocks rapid messages above a configured count and window |
-| `slow-mode` | Limits each member to one message per interval |
-| `quiet-hours` | Blocks messages during configured hours |
-| `approved-senders` | Allows only named WhatsApp JIDs |
-| `no-links` | Blocks URLs |
-| `no-forwarded` | Blocks forwarded messages |
-| `max-text-length` | Blocks text above a configured length |
-| `keyword-filter` | Blocks configured words; regular expressions require a local opt-in |
-| `text-only` | Allows text and blocks media |
-| `media-only` | Allows media and blocks plain text |
-| `video-only` | Allows video messages |
-| `voice-only` | Allows voice notes |
-| `no-images` | Blocks images |
-| `no-stickers` | Blocks stickers |
+Or run `/customize` for guided changes.
 
-Admins remain exempt unless an operator changes that setting. Keep the exemption on for the first enforcement period.
+The codebase is small enough that Claude can safely modify it.
 
-## Optional Claude agent
+## Contributing
 
-The agent can answer mentions, schedule tasks, browse the web, and manage group files. It processes untrusted messages, so GroupGuard keeps it off by default.
+**Don't add features. Add skills.**
 
-To enable it:
+If you want to add a new channel or agent provider, don't add it to trunk. New channel adapters land on the `channels` branch; new agent providers land on `providers`. Users install them in their own fork with `/add-<name>` skills, which copy the relevant module(s) into the standard paths, wire the registration, and pin dependencies.
 
-1. Install and start Docker.
-2. Add `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` to `.env`.
-3. Set `GROUPGUARD_AGENT_ENABLED=true`.
-4. Build the agent image with `./container/build.sh`.
-5. Run `npm run doctor`.
+This keeps trunk as pure registry and infra, and every fork stays lean — users get the channels and providers they asked for and nothing else.
 
-The main agent receives a read-only project mount. Set `GROUPGUARD_AGENT_PROJECT_WRITE_ENABLED=true` only for a short, supervised maintenance session.
+### RFS (Request for Skills)
 
-## Where to run it
+No channel or provider skills are currently requested — propose one via an issue.
 
-Use your computer for setup and a short observation test. For 24/7 operation, use a dedicated low-privilege VM with encrypted storage and a service supervisor. Do not run production and test instances against the same `store/auth` directory or WhatsApp number.
+## Requirements
 
-Recommended account layout:
-
-| Purpose | Number | Runtime |
-|---|---|---|
-| Initial test | Separate test number | Your computer, foreground process |
-| 24/7 moderation | Dedicated moderation number | Dedicated VM, systemd |
-| Development | Another test number | Separate state directory |
-
-See [Deployment](docs/DEPLOYMENT.md) for service setup.
+- macOS or Linux (Windows via WSL2)
+- Node.js 22+ and pnpm 10+ (the installer will install both if missing)
+- [Docker Desktop](https://docker.com/products/docker-desktop) (macOS/Windows) or Docker Engine (Linux)
+- [Claude Code](https://claude.ai/download) for `/customize`, `/debug`, error recovery during setup, and all `/add-<channel>` skills
 
 ## Architecture
 
-One Node.js process handles the WhatsApp connection, local guards, SQLite audit data, action budgets, and reconnection. Optional agent work runs in ephemeral Docker containers. Each group gets an isolated folder and session.
+```
+messaging apps → host process (router) → inbound.db → container (Bun, Claude Agent SDK) → outbound.db → host process (delivery) → messaging apps
+```
 
-This keeps the moderation path independent from AI availability and makes the default installation small enough to inspect.
+A single Node host orchestrates per-session agent containers. When a message arrives, the host routes it via the entity model (user → messaging group → agent group → session), writes it to the session's `inbound.db`, and wakes the container. The agent-runner inside the container polls `inbound.db`, runs the agent, and writes responses to `outbound.db`. The host polls `outbound.db` and delivers back through the channel adapter.
+
+Two SQLite files per session, each with exactly one writer — no cross-mount contention, no IPC, no stdin piping. Channels and alternative providers self-register at startup; trunk ships the registry and the Chat SDK bridge, while the adapters themselves are skill-installed per fork.
+
+For the full architecture writeup see [docs/architecture.md](docs/architecture.md); for the three-level isolation model see [docs/isolation-model.md](docs/isolation-model.md).
+
+Key files:
+- `src/index.ts` — entry point: DB init, channel adapters, delivery polls, sweep
+- `src/router.ts` — inbound routing: messaging group → agent group → session → `inbound.db`
+- `src/delivery.ts` — polls `outbound.db`, delivers via adapter, handles system actions
+- `src/host-sweep.ts` — 60s sweep: stale detection, due-message wake, recurrence
+- `src/session-manager.ts` — resolves sessions, opens `inbound.db` / `outbound.db`
+- `src/container-runner.ts` — spawns per-agent-group containers, OneCLI credential injection
+- `src/db/` — central DB (users, roles, agent groups, messaging groups, wiring, migrations)
+- `src/channels/` — channel adapter infra (adapters installed via `/add-<channel>` skills)
+- `src/providers/` — host-side provider config (`claude` baked in; others via skills)
+- `container/agent-runner/` — Bun agent-runner: poll loop, MCP tools, provider abstraction
+- `groups/<folder>/` — per-agent-group filesystem (`CLAUDE.md`, skills, container config)
+
+## FAQ
+
+**Why Docker?**
+
+Docker provides cross-platform support (macOS, Linux and Windows via WSL2) and a mature ecosystem.
+
+**Can I run this on Linux or Windows?**
+
+Yes. Docker is the default runtime and works on macOS, Linux, and Windows (via WSL2). Just run `bash nanoclaw.sh`.
+
+**Is this secure?**
+
+Agents run in containers, not behind application-level permission checks. They can only access explicitly mounted directories. Credentials never enter the container — outbound API requests route through [OneCLI's Agent Vault](https://github.com/onecli/onecli), which injects authentication at the proxy level and supports rate limits and access policies. You should still review what you're running, but the codebase is small enough that you actually can. See the [security documentation](https://docs.nanoclaw.dev/concepts/security) for the full security model.
+
+**Why no configuration files?**
+
+We don't want configuration sprawl. Every user should customize NanoClaw so that the code does exactly what they want, rather than configuring a generic system. If you prefer having config files, you can tell Claude to add them.
+
+**Can I use third-party or open-source models?**
+
+Yes. The supported path is `/add-opencode` (OpenRouter, OpenAI, Google, DeepSeek, and more via OpenCode config) or `/add-ollama-provider` (local open-weight models via Ollama). Both are configurable per agent group, so different agents can run on different backends in the same install.
+
+For one-off experiments, any Claude API-compatible endpoint also works via `.env`:
+
+```bash
+ANTHROPIC_BASE_URL=https://your-api-endpoint.com
+ANTHROPIC_AUTH_TOKEN=your-token-here
+```
+
+**How do I debug issues?**
+
+Ask Claude Code. "Why isn't the scheduler running?" "What's in the recent logs?" "Why did this message not get a response?" That's the AI-native approach that underlies NanoClaw.
+
+**Why isn't the setup working for me?**
+
+If a step fails, `nanoclaw.sh` hands off to Claude Code to diagnose and resume. If that doesn't resolve it, run `claude`, then `/debug`. If Claude identifies an issue likely to affect other users, open a PR against the relevant setup step or skill.
+
+**How do I uninstall NanoClaw?**
+
+```bash
+bash nanoclaw.sh --uninstall
+```
+
+Every install is tagged with a per-checkout id, so the uninstaller removes only what belongs to that copy: the background service, containers and image, app data and logs, your agents' files, and this copy's OneCLI vault agents. Shared things — the OneCLI app and your credentials, other NanoClaw copies on the machine — are left alone. It shows exactly what it found and asks for confirmation per group; nothing is deleted until you say yes. Use `--dry-run` to preview without changing anything, or `--yes` to skip the prompts. Your `.env` is backed up before removal. To finish, delete the checkout folder itself.
+
+**What changes will be accepted into the codebase?**
+
+Only security fixes, bug fixes, and clear improvements will be accepted to the base configuration. That's all.
+
+Everything else (new capabilities, OS compatibility, hardware support, enhancements) should be contributed as skills: channel and provider code on the `channels`/`providers` registry branches, everything else as a self-contained skill. See [docs/customizing.md](docs/customizing.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
+
+This keeps the base system minimal and lets every user customize their installation without inheriting features they don't want.
+
+## Community
+
+Questions? Ideas? [Join the Discord](https://discord.gg/VDdww8qS42).
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for breaking changes, or the [full release history](https://docs.nanoclaw.dev/changelog) on the documentation site.
 
 ## License
 
 MIT
+
+<img referrerpolicy="no-referrer-when-downgrade" src="https://static.scarf.sh/a.png?x-pxid=47894bd5-353b-42fe-bb97-74144e6df0bf" />
