@@ -24,6 +24,11 @@ groups/*
 *.keys.json
 .env
 .env*
+!.env.example
+
+# Operator-owned policy and directory data
+config/*.json
+!config/*.example.json
 
 # Temp files
 .tmp-*

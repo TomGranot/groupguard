@@ -1,0 +1,31 @@
+{
+  "version": "example-1",
+  "providers": [
+    {
+      "id": "northstar-repairs",
+      "categoryIds": ["home-repair"],
+      "name": "Northstar Repairs",
+      "contacts": [
+        {
+          "label": "Website",
+          "value": "https://example.com/providers/northstar-repairs"
+        }
+      ],
+      "recommendation": {
+        "quote": "Helped us with a difficult repair and communicated clearly.",
+        "attribution": "Community recommendation"
+      }
+    },
+    {
+      "id": "oak-and-hammer",
+      "categoryIds": ["home-repair"],
+      "name": "Oak & Hammer",
+      "contacts": [
+        {
+          "label": "Website",
+          "value": "https://example.com/providers/oak-and-hammer"
+        }
+      ]
+    }
+  ]
+}
