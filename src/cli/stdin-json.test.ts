@@ -42,10 +42,10 @@ describe('bounded stdin JSON', () => {
   });
 
   it('measures multibyte input as UTF-8 bytes across chunk boundaries', async () => {
-    const source = Buffer.from('{"value":"שלום"}', 'utf8');
-    const result = await readStdinJsonArgs(stream(source.subarray(0, 12), source.subarray(12)), {});
+    const source = Buffer.from('{"value":"éclair"}', 'utf8');
+    const result = await readStdinJsonArgs(stream(source.subarray(0, 11), source.subarray(11)), {});
 
-    expect(result).toEqual({ value: 'שלום' });
+    expect(result).toEqual({ value: 'éclair' });
   });
 
   it.each(['', '   \n\t'])('rejects empty input %#', async (source) => {

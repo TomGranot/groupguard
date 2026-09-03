@@ -35,7 +35,7 @@ export async function readStdinJsonArgs(
  * raw bytes depending on how the stream was configured upstream. Each chunk is
  * therefore normalized to a Buffer and the running total counts
  * `buffer.byteLength` — the true encoded size — rather than string length,
- * where a multibyte character (e.g. "ש", 2 bytes) would count as 1.
+ * where a multibyte character (e.g. "é", 2 bytes) would count as 1.
  *
  * Decoding to text happens exactly once, after the whole input is collected:
  * a chunk boundary can fall in the middle of a multibyte character, so

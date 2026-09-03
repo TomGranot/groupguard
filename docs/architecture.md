@@ -600,7 +600,7 @@ The container runner reads registered mounts from the channel registry — no ne
 // channels/discord.ts
 const DISCORD_TOKEN = process.env.DISCORD_BOT_TOKEN;
 
-// channels/gmail.ts  
+// channels/gmail.ts
 const GMAIL_CREDS = process.env.GMAIL_CREDENTIALS_PATH;
 ```
 
