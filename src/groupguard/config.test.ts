@@ -36,7 +36,10 @@ describe('GroupGuard configuration', () => {
 
   it('rejects private-chat IDs and unknown guards', () => {
     expect(() =>
-      parseGroupGuardConfig({ ...validConfig, groups: { 'private-chat@s.whatsapp.net': validConfig.groups['community-alpha@g.us'] } }),
+      parseGroupGuardConfig({
+        ...validConfig,
+        groups: { 'private-chat@s.whatsapp.net': validConfig.groups['community-alpha@g.us'] },
+      }),
     ).toThrow(/group/i);
     expect(() =>
       parseGroupGuardConfig({
@@ -59,5 +62,41 @@ describe('GroupGuard configuration', () => {
         },
       }),
     ).toThrow(/enforcementUnlocked/);
+  });
+
+  it('rejects private moderation notifications', () => {
+    expect(() =>
+      parseGroupGuardConfig({
+        ...validConfig,
+        groups: {
+          'community-alpha@g.us': {
+            moderation: { guards: [], notifyOnDelete: true },
+          },
+        },
+      }),
+    ).toThrow(/private moderation notifications/i);
+  });
+
+  it('rejects unsafe or unknown guard parameters', () => {
+    expect(() =>
+      parseGroupGuardConfig({
+        ...validConfig,
+        groups: {
+          'community-alpha@g.us': {
+            moderation: { guards: [{ id: 'keyword-filter', enabled: true, params: { patterns: ['(a+)+$'] } }] },
+          },
+        },
+      }),
+    ).toThrow(/regular expressions/i);
+    expect(() =>
+      parseGroupGuardConfig({
+        ...validConfig,
+        groups: {
+          'community-alpha@g.us': {
+            moderation: { guards: [{ id: 'no-spam', enabled: true, params: { maxMessages: 0 } }] },
+          },
+        },
+      }),
+    ).toThrow(/maxMessages/);
   });
 });
