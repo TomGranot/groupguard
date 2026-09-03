@@ -107,12 +107,20 @@ function statePath(transactionRoot: string): string {
   return path.join(transactionRoot, 'state.json');
 }
 
+function canonicalPath(candidate: string): string {
+  try {
+    return fs.realpathSync.native(candidate);
+  } catch {
+    return path.resolve(candidate);
+  }
+}
+
 function hasSafeStatePaths(state: UpdateState, projectRoot: string, transactionRoot: string, id: string): boolean {
   return (
     state.id === id &&
-    path.resolve(state.projectRoot) === path.resolve(projectRoot) &&
-    path.resolve(state.transactionRoot) === path.resolve(transactionRoot) &&
-    path.resolve(state.stageRoot) === path.join(path.resolve(transactionRoot), 'worktree') &&
+    canonicalPath(state.projectRoot) === canonicalPath(projectRoot) &&
+    canonicalPath(state.transactionRoot) === canonicalPath(transactionRoot) &&
+    canonicalPath(state.stageRoot) === canonicalPath(path.join(transactionRoot, 'worktree')) &&
     state.stageBranch === `update-nanoclaw/${id}` &&
     /^backup\/pre-update-[0-9a-f]{8}-\d{14}-[0-9a-f]{8}$/.test(state.backupBranch) &&
     /^pre-update-[0-9a-f]{8}-\d{14}-[0-9a-f]{8}$/.test(state.backupTag)
