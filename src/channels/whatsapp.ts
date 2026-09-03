@@ -42,6 +42,7 @@ import { isSafeAttachmentName } from '../attachment-safety.js';
 import { DATA_DIR } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
+import { decideWhatsAppIngress, parseAllowedWhatsAppGroups } from '../groupguard/ingress.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type {
@@ -407,9 +408,10 @@ const WHATSAPP_DEFAULTS: ChannelDefaults = computeWhatsappDefaults(WHATSAPP_SHAR
 
 registerChannelAdapter('whatsapp', {
   factory: () => {
-    const env = readEnvFile(['WHATSAPP_PHONE_NUMBER', 'WHATSAPP_ENABLED']);
+    const env = readEnvFile(['WHATSAPP_PHONE_NUMBER', 'WHATSAPP_ENABLED', 'GROUPGUARD_ALLOWED_GROUPS']);
     const phoneNumber = env.WHATSAPP_PHONE_NUMBER;
     const authDir = AUTH_DIR;
+    const allowedGroups = parseAllowedWhatsAppGroups(env.GROUPGUARD_ALLOWED_GROUPS);
 
     // Skip if no existing auth, no phone number for pairing, and not explicitly enabled (QR mode)
     const hasAuth = fs.existsSync(path.join(authDir, 'creds.json'));
@@ -829,11 +831,18 @@ registerChannelAdapter('whatsapp', {
       sock.ev.on('messages.upsert', async ({ messages }) => {
         for (const msg of messages) {
           try {
+            const rawJid = msg.key.remoteJid;
+            if (!rawJid || rawJid === 'status@broadcast') continue;
+
+            const ingress = decideWhatsAppIngress(rawJid, allowedGroups);
+            if (!ingress.accepted) {
+              log.debug('GroupGuard dropped WhatsApp event at ingress', { reason: ingress.reason });
+              continue;
+            }
+
             if (!msg.message) continue;
             const normalized = normalizeMessageContent(msg.message);
             if (!normalized) continue;
-            const rawJid = msg.key.remoteJid;
-            if (!rawJid || rawJid === 'status@broadcast') continue;
 
             // Translate LID → phone JID using v7's alt JID from extractAddressingContext
             const chatJid = await translateJid(rawJid, msg.key.remoteJidAlt);
