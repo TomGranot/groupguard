@@ -120,18 +120,19 @@ export class GroupGuardService {
       refreshTimer.unref();
     }
 
-    let service: GroupGuardService;
+    const serviceReference: { current?: GroupGuardService } = {};
     const runtime = new GroupGuardRuntime({
       config,
       ledger,
       safety: new AccountSafetyController(config.accountSafety),
-      directoryResponder: () => service.responder,
+      directoryResponder: () => serviceReference.current?.responder,
       sendMessage: options.sendMessage,
       deleteMessage: options.deleteMessage,
       resolveAdminState: options.resolveAdminState,
       enforcementEnabled: options.enforcementEnabled,
     });
-    service = new GroupGuardService(config, ledger, runtime, store, classifier, refreshTimer, responder);
+    const service = new GroupGuardService(config, ledger, runtime, store, classifier, refreshTimer, responder);
+    serviceReference.current = service;
     return service;
   }
 

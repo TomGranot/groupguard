@@ -726,15 +726,15 @@ registerChannelAdapter('whatsapp', {
       // `state.creds.me` is set as part of the QR / pairing-code handshake
       // and is the authoritative "this socket has an account" signal.
       if (phoneNumber && !state.creds.me) {
-        setTimeout(async () => {
-          try {
-            const code = await sock.requestPairingCode(phoneNumber);
-            log.info(`WhatsApp pairing code: ${code}`);
-            log.info('Enter in WhatsApp > Linked Devices > Link with phone number');
-            fs.writeFileSync(pairingCodeFile, code, 'utf-8');
-          } catch (err) {
-            log.error('Failed to request pairing code', { err });
-          }
+        setTimeout(() => {
+          void sock
+            .requestPairingCode(phoneNumber)
+            .then((code) => {
+              log.info(`WhatsApp pairing code: ${code}`);
+              log.info('Enter in WhatsApp > Linked Devices > Link with phone number');
+              fs.writeFileSync(pairingCodeFile, code, 'utf-8');
+            })
+            .catch((err: unknown) => log.error('Failed to request pairing code', { err }));
         }, 3000);
       }
 
@@ -743,7 +743,7 @@ registerChannelAdapter('whatsapp', {
 
         if (qr && !phoneNumber) {
           // QR code auth — print to terminal
-          (async () => {
+          void (async () => {
             try {
               const QRCode = await import('qrcode');
               const qrText = await QRCode.toString(qr, { type: 'terminal' });
@@ -859,7 +859,9 @@ registerChannelAdapter('whatsapp', {
         }
       });
 
-      sock.ev.on('creds.update', saveCreds);
+      sock.ev.on('creds.update', () => {
+        void saveCreds();
+      });
 
       // LID ↔ phone mapping updates (v7 replaces chats.phoneNumberShare)
       sock.ev.on('lid-mapping.update', ({ lid, pn }) => {
@@ -871,176 +873,178 @@ registerChannelAdapter('whatsapp', {
       });
 
       // Inbound messages
-      sock.ev.on('messages.upsert', async ({ messages }) => {
-        for (const msg of messages) {
-          try {
-            const rawJid = msg.key.remoteJid;
-            if (!rawJid || rawJid === 'status@broadcast') continue;
+      sock.ev.on('messages.upsert', ({ messages }) => {
+        void (async () => {
+          for (const msg of messages) {
+            try {
+              const rawJid = msg.key.remoteJid;
+              if (!rawJid || rawJid === 'status@broadcast') continue;
 
-            const ingress = decideWhatsAppIngress(rawJid, allowedGroups);
-            if (!ingress.accepted) {
-              log.debug('GroupGuard dropped WhatsApp event at ingress', { reason: ingress.reason });
-              continue;
-            }
-
-            if (!msg.message) continue;
-            const normalized = normalizeMessageContent(msg.message);
-            if (!normalized) continue;
-
-            // Translate LID → phone JID using v7's alt JID from extractAddressingContext
-            const chatJid = await translateJid(rawJid, msg.key.remoteJidAlt);
-
-            const messageDate = new Date(Number(msg.messageTimestamp) * 1000);
-            const timestamp = messageDate.toISOString();
-            const isGroup = chatJid.endsWith('@g.us');
-
-            // Notify metadata for group discovery
-            setupConfig.onMetadata(chatJid, undefined, isGroup);
-
-            let content =
-              normalized.conversation ||
-              normalized.extendedTextMessage?.text ||
-              normalized.imageMessage?.caption ||
-              normalized.videoMessage?.caption ||
-              '';
-
-            // Normalize bot LID mention → assistant name for trigger matching
-            // (dedicated mode only — see rewriteBotLidMention)
-            content = rewriteBotLidMention(content, WHATSAPP_SHARED, botLidUser, ASSISTANT_NAME);
-
-            // Resolve sender: in groups, participant may be LID — use participantAlt
-            const rawSender = msg.key.participant || msg.key.remoteJid || '';
-            const sender = rawSender.endsWith('@lid')
-              ? await translateJid(rawSender, msg.key.participantAlt)
-              : rawSender;
-            const senderName = msg.pushName || sender.split('@')[0];
-            const fromMe = msg.key.fromMe || false;
-            // Filter bot's own messages to prevent echo loops.
-            // In self-chat (user messaging their own number), all messages have
-            // fromMe=true — use sentMessageCache to distinguish bot echoes from
-            // user-typed messages. For all other chats, the blanket fromMe
-            // filter is correct since the user's phone messages shouldn't wake
-            // the agent in third-party conversations.
-            if (fromMe) {
-              const isSelfChat = botPhoneJid && chatJid === botPhoneJid;
-              if (!isSelfChat) continue;
-              if (sentMessageCache.has(msg.key.id || '')) continue;
-            }
-
-            const isBotMessage = WHATSAPP_SHARED ? content.startsWith(`${ASSISTANT_NAME}:`) : false;
-
-            // GroupGuard handles moderation and directory routing before the
-            // general NanoClaw router. It receives text and message properties,
-            // never downloaded media or private-chat events.
-            if (!groupGuardService) continue;
-            const contextInfo =
-              normalized.extendedTextMessage?.contextInfo ||
-              normalized.imageMessage?.contextInfo ||
-              normalized.videoMessage?.contextInfo ||
-              normalized.audioMessage?.contextInfo ||
-              normalized.documentMessage?.contextInfo ||
-              normalized.stickerMessage?.contextInfo;
-            const contentType =
-              Object.keys(normalized).find(
-                (key) => key !== 'messageContextInfo' && key !== 'senderKeyDistributionMessage',
-              ) ?? 'unknown';
-            const groupGuardResult = await groupGuardService.handle({
-              id: msg.key.id || `wa-${Date.now()}`,
-              groupId: chatJid,
-              senderId: sender,
-              senderAliases: [...new Set([rawSender, sender])],
-              text: content,
-              contentType,
-              isForwarded: contextInfo?.isForwarded === true,
-              isVoiceNote: normalized.audioMessage?.ptt === true,
-              timestamp: messageDate,
-              deleteToken: msg.key,
-            });
-            if (groupGuardResult.handled) continue;
-
-            // Only explicitly forwarded traffic reaches NanoClaw's general
-            // agent path. Media is downloaded after GroupGuard makes that
-            // decision, so ordinary directory-group traffic stays text-only.
-            const { attachments, failures } = await downloadInboundMedia(msg, normalized);
-            content = appendMediaFailureNote(content, failures);
-            if (!content && attachments.length === 0) continue;
-
-            // Check if this reply answers a pending question via slash command
-            const pending = pendingQuestions.get(chatJid);
-            if (pending && content.startsWith('/')) {
-              const cmd = content.trim().toLowerCase();
-              const matched = pending.options.find((o) => optionToCommand(o.label) === cmd);
-              if (matched) {
-                const voterName = msg.pushName || sender.split('@')[0];
-                setupConfig.onAction(pending.questionId, matched.value, sender);
-                pendingQuestions.delete(chatJid);
-                await sendRawMessage(chatJid, `${matched.selectedLabel} by ${voterName}`);
-                log.info('Question answered', {
-                  questionId: pending.questionId,
-                  value: matched.value,
-                  voterName,
-                });
-                continue; // Don't forward this reply to the agent
+              const ingress = decideWhatsAppIngress(rawJid, allowedGroups);
+              if (!ingress.accepted) {
+                log.debug('GroupGuard dropped WhatsApp event at ingress', { reason: ingress.reason });
+                continue;
               }
-            }
 
-            // Detect explicit @-mentions of the bot in groups. Detail in
-            // isBotMentionedInGroup(); short version is contextInfo.mentionedJid
-            // on text + caption-bearing messages, matched against the bot's
-            // phone JID and LID (#2560). Typed `@<name>` text never carries a
-            // pill, so in dedicated mode fall back to text matching when the
-            // message pills nobody (#3085).
-            const botMentionedInGroup =
-              isGroup &&
-              (isBotMentionedInGroup(normalized, botPhoneJid, botLidUser) ||
-                (!WHATSAPP_SHARED &&
-                  !hasMentionPills(normalized) &&
-                  isBotTypedMention(content, ASSISTANT_NAME, botPhoneJid)));
+              if (!msg.message) continue;
+              const normalized = normalizeMessageContent(msg.message);
+              if (!normalized) continue;
 
-            const inbound: InboundMessage = {
-              id: msg.key.id || `wa-${Date.now()}`,
-              kind: 'chat',
-              // Dedicated mode: DMs are addressed to the bot by definition.
-              // Mark them as platform-confirmed mentions so the router
-              // auto-creates an approval-required messaging_group when the
-              // chat is unknown, instead of silently dropping. In groups,
-              // only an explicit @-mention counts. Shared mode: never a
-              // mention — DMs and tags address the human owner.
-              isMention: computeIsMention(WHATSAPP_SHARED, isGroup, botMentionedInGroup),
-              isGroup,
-              content: {
+              // Translate LID → phone JID using v7's alt JID from extractAddressingContext
+              const chatJid = await translateJid(rawJid, msg.key.remoteJidAlt);
+
+              const messageDate = new Date(Number(msg.messageTimestamp) * 1000);
+              const timestamp = messageDate.toISOString();
+              const isGroup = chatJid.endsWith('@g.us');
+
+              // Notify metadata for group discovery
+              setupConfig.onMetadata(chatJid, undefined, isGroup);
+
+              let content =
+                normalized.conversation ||
+                normalized.extendedTextMessage?.text ||
+                normalized.imageMessage?.caption ||
+                normalized.videoMessage?.caption ||
+                '';
+
+              // Normalize bot LID mention → assistant name for trigger matching
+              // (dedicated mode only — see rewriteBotLidMention)
+              content = rewriteBotLidMention(content, WHATSAPP_SHARED, botLidUser, ASSISTANT_NAME);
+
+              // Resolve sender: in groups, participant may be LID — use participantAlt
+              const rawSender = msg.key.participant || msg.key.remoteJid || '';
+              const sender = rawSender.endsWith('@lid')
+                ? await translateJid(rawSender, msg.key.participantAlt)
+                : rawSender;
+              const senderName = msg.pushName || sender.split('@')[0];
+              const fromMe = msg.key.fromMe || false;
+              // Filter bot's own messages to prevent echo loops.
+              // In self-chat (user messaging their own number), all messages have
+              // fromMe=true — use sentMessageCache to distinguish bot echoes from
+              // user-typed messages. For all other chats, the blanket fromMe
+              // filter is correct since the user's phone messages shouldn't wake
+              // the agent in third-party conversations.
+              if (fromMe) {
+                const isSelfChat = botPhoneJid && chatJid === botPhoneJid;
+                if (!isSelfChat) continue;
+                if (sentMessageCache.has(msg.key.id || '')) continue;
+              }
+
+              const isBotMessage = WHATSAPP_SHARED ? content.startsWith(`${ASSISTANT_NAME}:`) : false;
+
+              // GroupGuard handles moderation and directory routing before the
+              // general NanoClaw router. It receives text and message properties,
+              // never downloaded media or private-chat events.
+              if (!groupGuardService) continue;
+              const contextInfo =
+                normalized.extendedTextMessage?.contextInfo ||
+                normalized.imageMessage?.contextInfo ||
+                normalized.videoMessage?.contextInfo ||
+                normalized.audioMessage?.contextInfo ||
+                normalized.documentMessage?.contextInfo ||
+                normalized.stickerMessage?.contextInfo;
+              const contentType =
+                Object.keys(normalized).find(
+                  (key) => key !== 'messageContextInfo' && key !== 'senderKeyDistributionMessage',
+                ) ?? 'unknown';
+              const groupGuardResult = await groupGuardService.handle({
+                id: msg.key.id || `wa-${Date.now()}`,
+                groupId: chatJid,
+                senderId: sender,
+                senderAliases: [...new Set([rawSender, sender])],
                 text: content,
-                sender,
-                senderName,
-                ...(attachments.length > 0 && { attachments }),
-                fromMe,
-                isBotMessage,
-                isGroup,
-                chatJid,
-              },
-              timestamp,
-            };
+                contentType,
+                isForwarded: contextInfo?.isForwarded === true,
+                isVoiceNote: normalized.audioMessage?.ptt === true,
+                timestamp: messageDate,
+                deleteToken: msg.key,
+              });
+              if (groupGuardResult.handled) continue;
 
-            // Discoverability for /debug: in shared mode nothing carries
-            // isMention, so unknown chats never auto-create messaging groups
-            // — traffic can look silently dropped. Note each chat once.
-            if (WHATSAPP_SHARED && chatJid !== botPhoneJid && !sharedModeLoggedChats.has(chatJid)) {
-              sharedModeLoggedChats.add(chatJid);
-              log.debug('Shared-number mode: forwarding chat to router without isMention', {
-                chatJid,
+              // Only explicitly forwarded traffic reaches NanoClaw's general
+              // agent path. Media is downloaded after GroupGuard makes that
+              // decision, so ordinary directory-group traffic stays text-only.
+              const { attachments, failures } = await downloadInboundMedia(msg, normalized);
+              content = appendMediaFailureNote(content, failures);
+              if (!content && attachments.length === 0) continue;
+
+              // Check if this reply answers a pending question via slash command
+              const pending = pendingQuestions.get(chatJid);
+              if (pending && content.startsWith('/')) {
+                const cmd = content.trim().toLowerCase();
+                const matched = pending.options.find((o) => optionToCommand(o.label) === cmd);
+                if (matched) {
+                  const voterName = msg.pushName || sender.split('@')[0];
+                  setupConfig.onAction(pending.questionId, matched.value, sender);
+                  pendingQuestions.delete(chatJid);
+                  await sendRawMessage(chatJid, `${matched.selectedLabel} by ${voterName}`);
+                  log.info('Question answered', {
+                    questionId: pending.questionId,
+                    value: matched.value,
+                    voterName,
+                  });
+                  continue; // Don't forward this reply to the agent
+                }
+              }
+
+              // Detect explicit @-mentions of the bot in groups. Detail in
+              // isBotMentionedInGroup(); short version is contextInfo.mentionedJid
+              // on text + caption-bearing messages, matched against the bot's
+              // phone JID and LID (#2560). Typed `@<name>` text never carries a
+              // pill, so in dedicated mode fall back to text matching when the
+              // message pills nobody (#3085).
+              const botMentionedInGroup =
+                isGroup &&
+                (isBotMentionedInGroup(normalized, botPhoneJid, botLidUser) ||
+                  (!WHATSAPP_SHARED &&
+                    !hasMentionPills(normalized) &&
+                    isBotTypedMention(content, ASSISTANT_NAME, botPhoneJid)));
+
+              const inbound: InboundMessage = {
+                id: msg.key.id || `wa-${Date.now()}`,
+                kind: 'chat',
+                // Dedicated mode: DMs are addressed to the bot by definition.
+                // Mark them as platform-confirmed mentions so the router
+                // auto-creates an approval-required messaging_group when the
+                // chat is unknown, instead of silently dropping. In groups,
+                // only an explicit @-mention counts. Shared mode: never a
+                // mention — DMs and tags address the human owner.
+                isMention: computeIsMention(WHATSAPP_SHARED, isGroup, botMentionedInGroup),
                 isGroup,
+                content: {
+                  text: content,
+                  sender,
+                  senderName,
+                  ...(attachments.length > 0 && { attachments }),
+                  fromMe,
+                  isBotMessage,
+                  isGroup,
+                  chatJid,
+                },
+                timestamp,
+              };
+
+              // Discoverability for /debug: in shared mode nothing carries
+              // isMention, so unknown chats never auto-create messaging groups
+              // — traffic can look silently dropped. Note each chat once.
+              if (WHATSAPP_SHARED && chatJid !== botPhoneJid && !sharedModeLoggedChats.has(chatJid)) {
+                sharedModeLoggedChats.add(chatJid);
+                log.debug('Shared-number mode: forwarding chat to router without isMention', {
+                  chatJid,
+                  isGroup,
+                });
+              }
+
+              // WhatsApp doesn't use threads — threadId is null
+              void setupConfig.onInbound(chatJid, null, inbound);
+            } catch (err) {
+              log.error('Error processing incoming WhatsApp message', {
+                err,
+                remoteJid: msg.key?.remoteJid,
               });
             }
-
-            // WhatsApp doesn't use threads — threadId is null
-            setupConfig.onInbound(chatJid, null, inbound);
-          } catch (err) {
-            log.error('Error processing incoming WhatsApp message', {
-              err,
-              remoteJid: msg.key?.remoteJid,
-            });
           }
-        }
+        })();
       });
     }
 
@@ -1210,7 +1214,7 @@ registerChannelAdapter('whatsapp', {
         if (reconnectTimer) clearTimeout(reconnectTimer);
         if (stableConnectionTimer) clearTimeout(stableConnectionTimer);
         groupGuardService?.close();
-        sock?.end(undefined);
+        void sock?.end(undefined);
         log.info('WhatsApp adapter shut down');
       },
 

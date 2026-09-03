@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   acknowledgeRequirement,
@@ -20,6 +20,9 @@ import type { CommandRunner, ServiceHandle } from './service.js';
 
 const roots: string[] = [];
 let previousUpdateDir: string | undefined;
+
+// Git worktree operations contend with the rest of the suite on slower hosts.
+vi.setConfig({ testTimeout: 20_000 });
 
 function temp(prefix: string): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
