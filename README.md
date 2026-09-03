@@ -1,8 +1,16 @@
 # GroupGuard
 
-GroupGuard watches selected WhatsApp groups, applies local moderation rules, and answers service-provider requests from your directory. It uses a local Qwen model to classify a request into your closed category list. Code, provider selection, and message delivery stay deterministic.
+<p align="center">
+  <img src="assets/groupguard-hero.webp" alt="A friendly robot guards private chats and selects two provider cards for a group request" width="100%">
+</p>
+
+<p align="center"><strong>A privacy-first WhatsApp group moderator and semantic directory assistant, built on NanoClaw.</strong></p>
+
+GroupGuard watches selected WhatsApp groups and answers service-provider requests from your directory. A local Qwen model maps natural language to your closed category list. GroupGuard then selects, formats, and sends provider contacts with deterministic code.
 
 The project runs on a remote Linux VM. The reference deployment uses [exe.dev](https://exe.dev), Ollama, `qwen3:4b`, and a dedicated WhatsApp account linked through NanoClaw's WhatsApp adapter.
+
+It suits a group administrator who already has a structured provider directory and wants useful replies without turning the group account into a general chatbot.
 
 > [!WARNING]
 > GroupGuard uses Baileys, an unofficial WhatsApp linked-device library. WhatsApp warns that unofficial clients can put an account at risk. Use a separate account, keep message volume low, start in a test group, and accept that WhatsApp may disconnect or restrict the account.
@@ -30,6 +38,20 @@ For a recognized category:
    - no recommendations: choose two providers.
 
 The inbound WhatsApp message ID seeds each choice. A delivery retry returns the same pair; a new request can return a different pair.
+
+## How I built this version
+
+I started with a narrow job: recognize when someone in an approved group asks for a service provider, then return up to two useful contacts. I enforced that boundary at each layer.
+
+1. **Give the bot its own WhatsApp identity.** Register the account in the standard WhatsApp app, then pair the remote process as a linked device. The phone handles registration and occasional account maintenance; the VM handles the running bot.
+2. **Use NanoClaw for the WhatsApp and service foundation.** NanoClaw supplies the channel adapter, session storage, process lifecycle, and optional agent routing. GroupGuard runs before open-ended agent routing.
+3. **Classify against a closed taxonomy.** Exact whole-message aliases take a fast path. Other phrasing goes to `qwen3:4b` through local Ollama. The model can return a category ID and confidence, or decline to match.
+4. **Keep provider selection out of the model.** TypeScript code queries the validated directory, ranks real community recommendations first, and fills any open slot from eligible providers. The model cannot invent a provider, contact, or quote.
+5. **Fail closed at ingress.** GroupGuard drops direct messages and messages from groups outside the allowlist before downloads, classification, or NanoClaw routing. Mentions have no special power.
+6. **Persist the state that matters.** SQLite stores outbound effects, WhatsApp credentials stay on disk, and the directory refreshes once a day. GroupGuard prewarms Qwen after boot and each successful refresh.
+7. **Roll out in a test group.** Verify the taxonomy and reply shape there, then add the production group. Moderation remains in observation mode until the configured waiting period ends.
+
+The LLM handles one bounded language task. TypeScript code owns access control, directory truth, provider ranking, message formatting, and delivery.
 
 ## Requirements
 
@@ -64,10 +86,10 @@ corepack prepare pnpm@10.34.5 --activate
 ollama pull qwen3:4b
 ```
 
-Clone the private repository with your preferred GitHub authentication, then install and build:
+Clone the repository, then install and build:
 
 ```bash
-git clone git@github.com:YOUR_ACCOUNT/groupguard.git
+git clone https://github.com/TomGranot/groupguard.git
 cd groupguard
 pnpm install --frozen-lockfile
 pnpm build
@@ -158,9 +180,7 @@ GroupGuard accepts a local JSON snapshot or an HTTPS JSON endpoint. It validates
       "id": "northstar-repairs",
       "categoryIds": ["home-repair"],
       "name": "Northstar Repairs",
-      "contacts": [
-        { "label": "Website", "value": "https://example.com/providers/northstar-repairs" }
-      ],
+      "contacts": [{ "label": "Website", "value": "https://example.com/providers/northstar-repairs" }],
       "recommendation": {
         "quote": "Helped us with a difficult repair and communicated clearly.",
         "attribution": "Community recommendation"
