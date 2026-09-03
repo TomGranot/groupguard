@@ -7,11 +7,13 @@ export interface GroupGuardEvent {
   id: string;
   groupId: string;
   senderId: string;
+  senderAliases?: string[];
   text: string;
   contentType: string;
   isForwarded: boolean;
   isVoiceNote: boolean;
   timestamp: Date;
+  deleteToken?: unknown;
 }
 
 export interface GroupGuardRuntimeResult {

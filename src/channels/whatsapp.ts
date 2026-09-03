@@ -41,6 +41,7 @@ import type { GroupMetadata, WAMessageKey, WAMessage, WASocket } from '@whiskeys
 import { isSafeAttachmentName } from '../attachment-safety.js';
 import { DATA_DIR } from '../config.js';
 import { readEnvFile } from '../env.js';
+import { GroupGuardService } from '../groupguard/bootstrap.js';
 import { log } from '../log.js';
 import { decideWhatsAppIngress, parseAllowedWhatsAppGroups } from '../groupguard/ingress.js';
 import { registerChannelAdapter } from './channel-registry.js';
@@ -408,10 +409,16 @@ const WHATSAPP_DEFAULTS: ChannelDefaults = computeWhatsappDefaults(WHATSAPP_SHAR
 
 registerChannelAdapter('whatsapp', {
   factory: () => {
-    const env = readEnvFile(['WHATSAPP_PHONE_NUMBER', 'WHATSAPP_ENABLED', 'GROUPGUARD_ALLOWED_GROUPS']);
+    const env = readEnvFile([
+      'WHATSAPP_PHONE_NUMBER',
+      'WHATSAPP_ENABLED',
+      'GROUPGUARD_ALLOWED_GROUPS',
+      'GROUPGUARD_CONFIG_PATH',
+      'GROUPGUARD_ENFORCEMENT_ENABLED',
+    ]);
     const phoneNumber = env.WHATSAPP_PHONE_NUMBER;
     const authDir = AUTH_DIR;
-    const allowedGroups = parseAllowedWhatsAppGroups(env.GROUPGUARD_ALLOWED_GROUPS);
+    let allowedGroups = parseAllowedWhatsAppGroups(env.GROUPGUARD_ALLOWED_GROUPS);
 
     // Skip if no existing auth, no phone number for pairing, and not explicitly enabled (QR mode)
     const hasAuth = fs.existsSync(path.join(authDir, 'creds.json'));
@@ -424,6 +431,7 @@ registerChannelAdapter('whatsapp', {
     let connected = false;
     let shuttingDown = false;
     let setupConfig: ChannelSetup;
+    let groupGuardService: GroupGuardService | undefined;
 
     // LID → phone JID mapping (WhatsApp's new ID system)
     const lidToPhoneMap: Record<string, string> = {};
@@ -847,7 +855,8 @@ registerChannelAdapter('whatsapp', {
             // Translate LID → phone JID using v7's alt JID from extractAddressingContext
             const chatJid = await translateJid(rawJid, msg.key.remoteJidAlt);
 
-            const timestamp = new Date(Number(msg.messageTimestamp) * 1000).toISOString();
+            const messageDate = new Date(Number(msg.messageTimestamp) * 1000);
+            const timestamp = messageDate.toISOString();
             const isGroup = chatJid.endsWith('@g.us');
 
             // Notify metadata for group discovery
@@ -863,17 +872,6 @@ registerChannelAdapter('whatsapp', {
             // Normalize bot LID mention → assistant name for trigger matching
             // (dedicated mode only — see rewriteBotLidMention)
             content = rewriteBotLidMention(content, WHATSAPP_SHARED, botLidUser, ASSISTANT_NAME);
-
-            // Download media attachments (images, video, audio, documents)
-            const { attachments, failures } = await downloadInboundMedia(msg, normalized);
-
-            // Surface failed downloads as text so the agent knows media was
-            // sent even when it couldn't be fetched — instead of silently
-            // dropping the attachment (or the whole message, if uncaptioned).
-            content = appendMediaFailureNote(content, failures);
-
-            // Skip empty protocol messages (no text and no attachments)
-            if (!content && attachments.length === 0) continue;
 
             // Resolve sender: in groups, participant may be LID — use participantAlt
             const rawSender = msg.key.participant || msg.key.remoteJid || '';
@@ -895,6 +893,42 @@ registerChannelAdapter('whatsapp', {
             }
 
             const isBotMessage = WHATSAPP_SHARED ? content.startsWith(`${ASSISTANT_NAME}:`) : false;
+
+            // GroupGuard handles moderation and directory routing before the
+            // general NanoClaw router. It receives text and message properties,
+            // never downloaded media or private-chat events.
+            if (!groupGuardService) continue;
+            const contextInfo =
+              normalized.extendedTextMessage?.contextInfo ||
+              normalized.imageMessage?.contextInfo ||
+              normalized.videoMessage?.contextInfo ||
+              normalized.audioMessage?.contextInfo ||
+              normalized.documentMessage?.contextInfo ||
+              normalized.stickerMessage?.contextInfo;
+            const contentType =
+              Object.keys(normalized).find(
+                (key) => key !== 'messageContextInfo' && key !== 'senderKeyDistributionMessage',
+              ) ?? 'unknown';
+            const groupGuardResult = await groupGuardService.handle({
+              id: msg.key.id || `wa-${Date.now()}`,
+              groupId: chatJid,
+              senderId: sender,
+              senderAliases: [...new Set([rawSender, sender])],
+              text: content,
+              contentType,
+              isForwarded: contextInfo?.isForwarded === true,
+              isVoiceNote: normalized.audioMessage?.ptt === true,
+              timestamp: messageDate,
+              deleteToken: msg.key,
+            });
+            if (groupGuardResult.handled) continue;
+
+            // Only explicitly forwarded traffic reaches NanoClaw's general
+            // agent path. Media is downloaded after GroupGuard makes that
+            // decision, so ordinary directory-group traffic stays text-only.
+            const { attachments, failures } = await downloadInboundMedia(msg, normalized);
+            content = appendMediaFailureNote(content, failures);
+            if (!content && attachments.length === 0) continue;
 
             // Check if this reply answers a pending question via slash command
             const pending = pendingQuestions.get(chatJid);
@@ -985,6 +1019,51 @@ registerChannelAdapter('whatsapp', {
 
       async setup(hostConfig: ChannelSetup) {
         setupConfig = hostConfig;
+
+        try {
+          groupGuardService = await GroupGuardService.create({
+            projectRoot: process.cwd(),
+            configPath: env.GROUPGUARD_CONFIG_PATH || 'config/groupguard.json',
+            enforcementEnabled: env.GROUPGUARD_ENFORCEMENT_ENABLED === 'true',
+            async sendMessage(groupId, text) {
+              if (!connected) throw new Error('WhatsApp is disconnected');
+              const formatted = formatWhatsApp(text);
+              const payload: { text: string; mentions?: string[] } = { text: formatted.text };
+              if (formatted.mentions.length > 0) payload.mentions = formatted.mentions;
+              const sent = await sock.sendMessage(groupId, payload);
+              if (!sent?.key?.id) throw new Error('WhatsApp did not return a message ID');
+              if (sent.message) sentMessageCache.set(sent.key.id, sent.message);
+              return sent.key.id;
+            },
+            async deleteMessage(event) {
+              const key = event.deleteToken as WAMessageKey | undefined;
+              if (!key?.id || !key.remoteJid) throw new Error('WhatsApp deletion key is missing');
+              await sock.sendMessage(event.groupId, { delete: key });
+            },
+            async resolveAdminState(event) {
+              const metadata = await getNormalizedGroupMetadata(event.groupId);
+              if (!metadata) return { verified: false, senderIsAdmin: false };
+              const administrators = metadata.participants
+                .filter((participant) => participant.admin === 'admin' || participant.admin === 'superadmin')
+                .map((participant) => participant.id);
+              const senderAliases = new Set([event.senderId, ...(event.senderAliases ?? [])]);
+              return {
+                verified: true,
+                senderIsAdmin: administrators.some((administrator) => senderAliases.has(administrator)),
+              };
+            },
+          });
+          const configuredGroups = groupGuardService.allowedGroups;
+          allowedGroups =
+            allowedGroups.size === 0
+              ? configuredGroups
+              : new Set([...configuredGroups].filter((groupId) => allowedGroups.has(groupId)));
+          log.info('GroupGuard runtime initialized', { configuredGroups: allowedGroups.size });
+        } catch (error) {
+          groupGuardService = undefined;
+          allowedGroups = new Set();
+          log.error('GroupGuard configuration failed; WhatsApp ingress is closed', { error });
+        }
 
         // Connect and wait for first open
         await new Promise<void>((resolve, reject) => {
@@ -1093,6 +1172,7 @@ registerChannelAdapter('whatsapp', {
       async teardown() {
         shuttingDown = true;
         connected = false;
+        groupGuardService?.close();
         sock?.end(undefined);
         log.info('WhatsApp adapter shut down');
       },
