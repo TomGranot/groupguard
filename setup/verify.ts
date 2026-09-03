@@ -1,0 +1,311 @@
+/**
+ * Step: verify — End-to-end health check of the full installation.
+ * Replaces 09-verify.sh
+ *
+ * Uses the configured central-DB driver and platform-aware service checks.
+ */
+import { execSync } from 'child_process';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+
+import { readEnvFile } from '../src/env.js';
+import { log } from '../src/log.js';
+import { getLaunchdLabel, getSystemdUnit } from '../src/install-slug.js';
+import { inspectCentralDb } from './central-db-inspection.js';
+import { inspectAgentImage, readImageSource } from './lib/registry-state.js';
+import { getPlatform, getServiceManager, hasSystemd, isRoot } from './platform.js';
+import { emitStatus } from './status.js';
+
+export async function run(_args: string[]): Promise<void> {
+  const projectRoot = process.cwd();
+  const platform = getPlatform();
+  const homeDir = os.homedir();
+
+  log.info('Starting verification');
+
+  // 1. Check service status + detect checkout mismatch.
+  //
+  // Why the mismatch matters: the host reads `<projectRoot>/data/v2.db` and
+  // binds `<DATA_DIR>/cli.sock` relative to the project root it was started
+  // from. If the running service is from a sibling checkout (common for
+  // developers with multiple clones), nothing in this checkout is actually
+  // wired up. Surface the mismatch directly so the user knows to point the
+  // service at the right folder.
+  let service: 'not_found' | 'stopped' | 'running' | 'running_other_checkout' = 'not_found';
+  let runningFromPath: string | null = null;
+  const mgr = getServiceManager();
+
+  const launchdLabel = getLaunchdLabel(projectRoot);
+  const systemdUnit = getSystemdUnit(projectRoot);
+
+  if (mgr === 'launchd') {
+    try {
+      const output = execSync('launchctl list', { encoding: 'utf-8' });
+      const line = output.split('\n').find((l) => l.includes(launchdLabel));
+      if (line) {
+        const pidField = line.trim().split(/\s+/)[0];
+        if (pidField !== '-' && pidField) {
+          service = 'running';
+          const pid = Number(pidField);
+          if (Number.isInteger(pid) && pid > 0) {
+            runningFromPath = resolveBinaryScript(pid);
+          }
+        } else {
+          service = 'stopped';
+        }
+      }
+    } catch {
+      // launchctl not available
+    }
+  } else if (mgr === 'systemd') {
+    const prefix = isRoot() ? 'systemctl' : 'systemctl --user';
+    try {
+      execSync(`${prefix} is-active ${systemdUnit}`, { stdio: 'ignore' });
+      service = 'running';
+      try {
+        const pidStr = execSync(`${prefix} show ${systemdUnit} -p MainPID --value`, { encoding: 'utf-8' }).trim();
+        const pid = Number(pidStr);
+        if (Number.isInteger(pid) && pid > 0) {
+          runningFromPath = resolveBinaryScript(pid);
+        }
+      } catch {
+        // couldn't read MainPID; leave runningFromPath null
+      }
+    } catch {
+      try {
+        const output = execSync(`${prefix} list-unit-files`, {
+          encoding: 'utf-8',
+        });
+        if (output.includes(systemdUnit)) {
+          service = 'stopped';
+        }
+      } catch {
+        // systemctl not available
+      }
+    }
+  } else {
+    // Check for nohup PID file
+    const pidFile = path.join(projectRoot, 'nanoclaw.pid');
+    if (fs.existsSync(pidFile)) {
+      try {
+        const raw = fs.readFileSync(pidFile, 'utf-8').trim();
+        const pid = Number(raw);
+        if (raw && Number.isInteger(pid) && pid > 0) {
+          process.kill(pid, 0);
+          service = 'running';
+          runningFromPath = resolveBinaryScript(pid);
+        }
+      } catch {
+        service = 'stopped';
+      }
+    }
+  }
+
+  if (service === 'running' && runningFromPath && !isPathInside(runningFromPath, projectRoot)) {
+    service = 'running_other_checkout';
+  }
+
+  log.info('Service status', { service, runningFromPath });
+
+  // 2. Check container runtime
+  let containerRuntime = 'none';
+  try {
+    execSync('docker info', { stdio: 'ignore' });
+    containerRuntime = 'docker';
+  } catch {
+    // Docker not running
+  }
+
+  // 3. Check credentials
+  let credentials = 'missing';
+  const envFile = path.join(projectRoot, '.env');
+  if (fs.existsSync(envFile)) {
+    const envContent = fs.readFileSync(envFile, 'utf-8');
+    if (/^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|ONECLI_URL)=/m.test(envContent)) {
+      credentials = 'configured';
+    }
+  }
+
+  // 4. Check channel auth (detect configured channels by credentials)
+  const envVars = readEnvFile([
+    'TELEGRAM_BOT_TOKEN',
+    'SLACK_BOT_TOKEN',
+    'SLACK_APP_TOKEN',
+    'DISCORD_BOT_TOKEN',
+    'GITHUB_TOKEN',
+    'LINEAR_API_KEY',
+    'GCHAT_CREDENTIALS',
+    'TEAMS_APP_ID',
+    'TEAMS_APP_PASSWORD',
+    'WEBEX_BOT_TOKEN',
+    'MATRIX_ACCESS_TOKEN',
+    'RESEND_API_KEY',
+    'WHATSAPP_ACCESS_TOKEN',
+    'IMESSAGE_ENABLED',
+    'PHOTON_PROJECT_ID',
+    'PHOTON_PROJECT_SECRET',
+  ]);
+
+  const has = (key: string) => !!(process.env[key] || envVars[key]);
+  const channelAuth: Record<string, string> = {};
+
+  // WhatsApp Baileys: check for auth credentials on disk
+  const authDir = path.join(projectRoot, 'store', 'auth');
+  if (fs.existsSync(authDir) && fs.readdirSync(authDir).length > 0) {
+    channelAuth.whatsapp = 'authenticated';
+  }
+
+  // Token-based channels
+  if (has('DISCORD_BOT_TOKEN')) channelAuth.discord = 'configured';
+  if (has('TELEGRAM_BOT_TOKEN')) channelAuth.telegram = 'configured';
+  if (has('SLACK_BOT_TOKEN') && has('SLACK_APP_TOKEN')) channelAuth.slack = 'configured';
+  if (has('GITHUB_TOKEN')) channelAuth.github = 'configured';
+  if (has('LINEAR_API_KEY')) channelAuth.linear = 'configured';
+  if (has('GCHAT_CREDENTIALS')) channelAuth.gchat = 'configured';
+  if (has('TEAMS_APP_ID') && has('TEAMS_APP_PASSWORD')) channelAuth.teams = 'configured';
+  if (has('WEBEX_BOT_TOKEN')) channelAuth.webex = 'configured';
+  if (has('MATRIX_ACCESS_TOKEN')) channelAuth.matrix = 'configured';
+  if (has('RESEND_API_KEY')) channelAuth.resend = 'configured';
+  if (has('WHATSAPP_ACCESS_TOKEN')) channelAuth['whatsapp-cloud'] = 'configured';
+  // One `imessage` channel, either backend: local (IMESSAGE_ENABLED) or
+  // hosted (Photon project credentials).
+  if (has('IMESSAGE_ENABLED') || (has('PHOTON_PROJECT_ID') && has('PHOTON_PROJECT_SECRET'))) {
+    channelAuth.imessage = 'configured';
+  }
+
+  const configuredChannels = Object.keys(channelAuth);
+
+  // 5. Check registered groups in v2 central DB (agent_groups + messaging_group_agents),
+  //    plus how many agent groups pin an image of their own (reported in step 7).
+  //    The two counts get their own try/catch: they read different tables, and a
+  //    partially migrated DB must not hide one behind the other's failure.
+  const { registeredGroups, derivedGroups } = await inspectCentralDb(projectRoot);
+
+  // 6. Check mount allowlist
+  let mountAllowlist = 'missing';
+  if (fs.existsSync(path.join(homeDir, '.config', 'nanoclaw', 'mount-allowlist.json'))) {
+    mountAllowlist = 'configured';
+  }
+
+  // 7. Where the agent image came from — intended vs actual.
+  //
+  // These two can disagree, and reporting the disagreement is the whole point.
+  // The hardened path pulls by digest and retags onto the same slug tag a local
+  // build writes, so nothing downstream can tell them apart; a pull that failed
+  // and fell back to `./container/build.sh` would leave `.env` saying "hardened"
+  // over locally built bits. IMAGE_SOURCE is the operator's intent, read from
+  // `.env`; IMAGE_SOURCE_ACTUAL is read off the image itself and cannot be
+  // talked into agreeing. Only inspect once `docker info` has already
+  // succeeded — otherwise a stopped daemon reads as "image missing".
+  const imageSource = readImageSource();
+  const image =
+    containerRuntime === 'docker'
+      ? inspectAgentImage(projectRoot)
+      : { source: 'unknown' as const, registryDigest: undefined };
+
+  // Deferred-wire channels can't have a group yet: their platform id only
+  // exists after the first inbound DM (see add-teams' "Finish wiring"), so
+  // configured-but-unwired is pending operator action, not a broken install.
+  // Only claim pending when EVERY configured channel is defer-wire — a
+  // wire-during-setup channel (slack, telegram, …) with zero groups is a
+  // genuine failure this must not mask.
+  const wiringPending =
+    registeredGroups === 0 &&
+    configuredChannels.length > 0 &&
+    configuredChannels.every((c) => DEFER_WIRE_CHANNELS.has(c));
+
+  // Determine overall status. The cli-agent step earlier in setup already
+  // proved the agent round-trip works; verify is a static health check.
+  const status = determineVerifyStatus({
+    service,
+    credentials,
+    registeredGroups,
+    wiringPending,
+  });
+
+  log.info('Verification complete', {
+    status,
+    channelAuth,
+    wiringPending,
+    imageSource,
+    imageSourceActual: image.source,
+    derivedGroups,
+  });
+
+  // The image fields are reporting only — they are not inputs to
+  // determineVerifyStatus above. A derived-image pin is a real finding on the
+  // hardened path but the normal, supported state of an install_packages user
+  // on the local path, and IMAGE_SOURCE_ACTUAL is 'unknown' whenever Docker
+  // isn't reachable. Failing verify on either would fire offerClaudeOnFailure
+  // (setup/auto.ts) at installs that are working exactly as designed.
+  emitStatus('VERIFY', {
+    SERVICE: service,
+    CONTAINER_RUNTIME: containerRuntime,
+    CREDENTIALS: credentials,
+    CONFIGURED_CHANNELS: configuredChannels.join(','),
+    CHANNEL_AUTH: JSON.stringify(channelAuth),
+    REGISTERED_GROUPS: registeredGroups,
+    MOUNT_ALLOWLIST: mountAllowlist,
+    IMAGE_SOURCE: imageSource,
+    IMAGE_SOURCE_ACTUAL: image.source,
+    // Registry manifest digest, to compare against the `agent-image` pin in
+    // versions.json. Empty for a locally built image — it has never had one.
+    IMAGE_DIGEST: image.registryDigest ?? '',
+    DERIVED_GROUPS: derivedGroups,
+    ...(wiringPending ? { WIRING: 'pending_first_dm' } : {}),
+    STATUS: status,
+    LOG: 'logs/setup.log',
+  });
+
+  if (status === 'failed') process.exit(1);
+}
+
+/**
+ * Channels whose wiring only completes after the first inbound message —
+ * the platform id doesn't exist until the bot is DM'd, so setup ends with
+ * the channel configured but no group wired. Kept in lockstep with the
+ * wireIfResolved call site in setup/auto.ts (its unresolved drop-through
+ * leaves the channel configured but unwired).
+ */
+export const DEFER_WIRE_CHANNELS = new Set(['teams']);
+
+export function determineVerifyStatus(input: {
+  service: 'not_found' | 'stopped' | 'running' | 'running_other_checkout';
+  credentials: string;
+  registeredGroups: number;
+  /** Zero groups but every configured channel defers wiring to the first DM. */
+  wiringPending?: boolean;
+}): 'success' | 'failed' {
+  return input.service === 'running' &&
+    input.credentials !== 'missing' &&
+    (input.registeredGroups > 0 || input.wiringPending === true)
+    ? 'success'
+    : 'failed';
+}
+
+/**
+ * Given a PID, resolve the script path the process is executing (i.e. the
+ * first `.js` / `.ts` / `.mjs` arg after `node`). Returns null on any
+ * error — callers should treat null as "couldn't tell" and skip the
+ * mismatch check rather than flag a false positive.
+ */
+function resolveBinaryScript(pid: number): string | null {
+  try {
+    // BSD ps (macOS) and util-linux both honour `-o command=` (full argv,
+    // no header). Node argv: "node /path/to/dist/index.js ...".
+    const out = execSync(`ps -p ${pid} -o command=`, {
+      encoding: 'utf-8',
+    }).trim();
+    const tokens = out.split(/\s+/);
+    const script = tokens.find((t) => /\.(js|mjs|cjs|ts)$/.test(t));
+    return script ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function isPathInside(candidate: string, parent: string): boolean {
+  const rel = path.relative(parent, candidate);
+  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+}

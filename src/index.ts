@@ -1,938 +1,197 @@
-import makeWASocket, {
-  useMultiFileAuthState,
-  DisconnectReason,
-  makeCacheableSignalKeyStore,
-  WASocket
-} from '@whiskeysockets/baileys';
-import pino from 'pino';
-import { execSync } from 'child_process';
-import fs from 'fs';
-import path from 'path';
-import { createHmac } from 'crypto';
+/**
+ * NanoClaw — main entry point.
+ *
+ * Thin orchestrator: init DB, run migrations, start channel adapters,
+ * start delivery polls, start sweep, handle shutdown.
+ */
+import { backfillContainerConfigs } from './backfill-container-configs.js';
+import { CENTRAL_DB_PATH } from './config.js';
+import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
+import { adoptRunningSessions } from './container-runner.js';
+import { closeDb, initDb } from './db/connection.js';
+import { runMigrations } from './db/migrations/index.js';
+import { getSessionDriver } from './drivers/index.js';
+import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
+import { startHostSweep, stopHostSweep } from './host-sweep.js';
+import { startHostModules, stopHostModules } from './host-lifecycle.js';
+import { routeInbound } from './router.js';
+import { log } from './log.js';
+import { enforceUpgradeTripwire } from './upgrade-state.js';
 
+// Response registry lives in response-registry.ts to break the
+// circular import cycle: src/index.ts imports src/modules/index.js for side
+// effects, and the modules call registerResponseHandler at top level — which
+// would hit a TDZ error if the array lived here.
+import { getResponseHandlers, type ResponsePayload } from './response-registry.js';
+
+const hostAbortController = new AbortController();
+
+async function dispatchResponse(payload: ResponsePayload): Promise<void> {
+  for (const handler of getResponseHandlers()) {
+    try {
+      const claimed = await handler(payload);
+      if (claimed) return;
+    } catch (err) {
+      log.error('Response handler threw', { questionId: payload.questionId, err });
+    }
+  }
+  log.warn('Unclaimed response', { questionId: payload.questionId, value: payload.value });
+}
+
+// Channel barrel — each enabled channel self-registers on import.
+// Channel skills uncomment lines in channels/index.ts to enable them.
+import './channels/index.js';
+
+// Modules barrel — imports registration modules, including the singular
+// mailbox composition slot. Imported for side effects.
+import './modules/index.js';
+
+// CLI command barrel — populates the `ncl` registry before the CLI server
+// accepts connections.
+import './cli/commands/index.js';
+import './cli/delivery-action.js';
+import { startCliServer, stopCliServer } from './cli/socket-server.js';
+
+import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
 import {
-  ASSISTANT_NAME,
-  POLL_INTERVAL,
-  STORE_DIR,
-  DATA_DIR,
-  TRIGGER_PATTERN,
-  IPC_POLL_INTERVAL,
-  TIMEZONE,
-  MAIN_GROUP_FOLDER,
-  AGENT_ENABLED,
-  ENFORCEMENT_ENABLED,
-  MAX_OUTBOUND_MESSAGES_PER_MINUTE,
-  MAX_MODERATION_ACTIONS_PER_MINUTE,
-  MAX_MODERATION_DMS_PER_HOUR,
-  SAFETY_FAILURE_THRESHOLD,
-  SAFETY_CIRCUIT_COOLDOWN_MS,
-  WHATSAPP_ACTION_TIMEOUT_MS,
-  RECONNECT_MAX_ATTEMPTS,
-  RECONNECT_BASE_DELAY_MS,
-  RECONNECT_MAX_DELAY_MS,
-  TYPING_INDICATOR_ENABLED,
-  PUBLIC_PLAYGROUND_ENABLED,
-} from './config.js';
-import { RegisteredGroup, Session, NewMessage } from './types.js';
-import { initDatabase, storeMessage, storeChatMetadata, getNewMessages, getMessagesSince, getAllTasks, getTaskById, updateChatName, getAllChats, getLastGroupSync, setLastGroupSync, getModerationStats, getModerationLogs, claimPlaygroundEvent, finishPlaygroundEvent, getPlaygroundRateUsage } from './db.js';
-import { startSchedulerLoop } from './task-scheduler.js';
-import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot, AvailableGroup } from './container-runner.js';
-import { loadJson, saveJson } from './utils.js';
-import { initModerator, moderateMessage, refreshAdminCache, updateAdminCache } from './moderator.js';
-import { AccountSafetyController, withActionTimeout } from './account-safety.js';
-import { parseRegisteredGroups, registeredGroupSchema } from './group-config.js';
-import { parsePlaygroundCommand, PlaygroundResponder } from './playground.js';
-
-const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
-
-const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  transport: { target: 'pino-pretty', options: { colorize: true } }
-});
-
-let sock: WASocket;
-let lastTimestamp = '';
-let sessions: Session = {};
-let registeredGroups: Record<string, RegisteredGroup> = {};
-let lastAgentTimestamp: Record<string, string> = {};
-let messageLoopRunning = false;
-let backgroundLoopsStarted = false;
-let reconnectAttempts = 0;
-let reconnectTimer: NodeJS.Timeout | undefined;
-let stableConnectionTimer: NodeJS.Timeout | undefined;
-
-const accountSafety = new AccountSafetyController({
-  budgets: {
-    message: { limit: MAX_OUTBOUND_MESSAGES_PER_MINUTE, windowMs: 60_000 },
-    moderation: { limit: MAX_MODERATION_ACTIONS_PER_MINUTE, windowMs: 60_000 },
-    'moderation-dm': { limit: MAX_MODERATION_DMS_PER_HOUR, windowMs: 60 * 60_000 },
-  },
-  failureThreshold: SAFETY_FAILURE_THRESHOLD,
-  circuitCooldownMs: SAFETY_CIRCUIT_COOLDOWN_MS,
-});
-const playgroundResponder = new PlaygroundResponder();
-let playgroundAuditKey: Buffer | undefined;
-
-function hashPlaygroundActor(senderJid: string): string {
-  if (!playgroundAuditKey) {
-    const keyPath = path.join(STORE_DIR, 'playground-audit.key');
-    playgroundAuditKey = fs.readFileSync(keyPath);
-    if (playgroundAuditKey.length < 32) {
-      throw new Error('Playground audit key must contain at least 32 bytes');
-    }
-  }
-  return createHmac('sha256', playgroundAuditKey).update(senderJid).digest('hex').slice(0, 24);
-}
-
-async function setTyping(jid: string, isTyping: boolean): Promise<void> {
-  if (!TYPING_INDICATOR_ENABLED) return;
-  try {
-    await sock.sendPresenceUpdate(isTyping ? 'composing' : 'paused', jid);
-  } catch (err) {
-    logger.debug({ jid, err }, 'Failed to update typing status');
-  }
-}
-
-function loadState(): void {
-  const statePath = path.join(DATA_DIR, 'router_state.json');
-  const state = loadJson<{ last_timestamp?: string; last_agent_timestamp?: Record<string, string> }>(statePath, {});
-  lastTimestamp = state.last_timestamp || '';
-  lastAgentTimestamp = state.last_agent_timestamp || {};
-  sessions = loadJson(path.join(DATA_DIR, 'sessions.json'), {});
-  const rawGroups = loadJson<unknown>(path.join(DATA_DIR, 'registered_groups.json'), {});
-  const parsedGroups = parseRegisteredGroups(rawGroups);
-  registeredGroups = parsedGroups.groups;
-  for (const error of parsedGroups.errors) logger.error({ error }, 'Unsafe group configuration ignored');
-  logger.info(
-    {
-      groupCount: Object.keys(registeredGroups).length,
-      agentEnabled: AGENT_ENABLED,
-      enforcementEnabled: ENFORCEMENT_ENABLED,
-    },
-    'State loaded',
-  );
-}
-
-function saveState(): void {
-  saveJson(path.join(DATA_DIR, 'router_state.json'), { last_timestamp: lastTimestamp, last_agent_timestamp: lastAgentTimestamp });
-  saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
-}
-
-function registerGroup(jid: string, group: RegisteredGroup): void {
-  const parsed = parseRegisteredGroups({ [jid]: group });
-  if (parsed.errors.length > 0 || !parsed.groups[jid]) {
-    throw new Error(parsed.errors.join('; ') || 'Invalid group configuration');
-  }
-  registeredGroups[jid] = parsed.groups[jid];
-  saveJson(path.join(DATA_DIR, 'registered_groups.json'), registeredGroups);
-
-  // Create group folder
-  const groupDir = path.join(DATA_DIR, '..', 'groups', group.folder);
-  fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
-
-  logger.info({ jid, name: group.name, folder: group.folder }, 'Group registered');
-}
-
-/**
- * Sync group metadata from WhatsApp.
- * Fetches all participating groups and stores their names in the database.
- * Called on startup, daily, and on-demand via IPC.
- */
-async function syncGroupMetadata(force = false): Promise<void> {
-  // Check if we need to sync (skip if synced recently, unless forced)
-  if (!force) {
-    const lastSync = getLastGroupSync();
-    if (lastSync) {
-      const lastSyncTime = new Date(lastSync).getTime();
-      const now = Date.now();
-      if (now - lastSyncTime < GROUP_SYNC_INTERVAL_MS) {
-        logger.debug({ lastSync }, 'Skipping group sync - synced recently');
-        return;
-      }
-    }
-  }
-
-  try {
-    logger.info('Syncing group metadata from WhatsApp...');
-    const groups = await sock.groupFetchAllParticipating();
-
-    let count = 0;
-    for (const [jid, metadata] of Object.entries(groups)) {
-      if (metadata.subject) {
-        updateChatName(jid, metadata.subject);
-        count++;
-      }
-    }
-
-    setLastGroupSync();
-    logger.info({ count }, 'Group metadata synced');
-  } catch (err) {
-    logger.error({ err }, 'Failed to sync group metadata');
-  }
-}
-
-/**
- * Get available groups list for the agent.
- * Returns groups ordered by most recent activity.
- */
-function getAvailableGroups(): AvailableGroup[] {
-  const chats = getAllChats();
-  const registeredJids = new Set(Object.keys(registeredGroups));
-
-  return chats
-    .filter(c => c.jid !== '__group_sync__' && c.jid.endsWith('@g.us'))
-    .map(c => ({
-      jid: c.jid,
-      name: c.name,
-      lastActivity: c.last_message_time,
-      isRegistered: registeredJids.has(c.jid)
-    }));
-}
-
-async function processMessage(msg: NewMessage): Promise<void> {
-  if (!AGENT_ENABLED) return;
-  const group = registeredGroups[msg.chat_jid];
-  if (!group) return;
-  if (group.playground?.enabled) return;
-
-  const content = msg.content.trim();
-  const isMain = group.folder === MAIN_GROUP_FOLDER;
-
-  // Main group responds to all messages; other groups require trigger prefix
-  if (!isMain && !TRIGGER_PATTERN.test(content)) return;
-
-  // Get all messages since last agent interaction so the session has full context
-  const sinceTimestamp = lastAgentTimestamp[msg.chat_jid] || '';
-  const missedMessages = getMessagesSince(msg.chat_jid, sinceTimestamp, ASSISTANT_NAME);
-
-  const lines = missedMessages.map(m => {
-    // Escape XML special characters in content
-    const escapeXml = (s: string) => s
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
-    return `<message sender="${escapeXml(m.sender_name)}" time="${m.timestamp}">${escapeXml(m.content)}</message>`;
-  });
-  const prompt = `<messages>\n${lines.join('\n')}\n</messages>`;
-
-  if (!prompt) return;
-
-  logger.info({ group: group.name, messageCount: missedMessages.length }, 'Processing message');
-
-  await setTyping(msg.chat_jid, true);
-  const response = await runAgent(group, prompt, msg.chat_jid);
-  await setTyping(msg.chat_jid, false);
-
-  if (response) {
-    lastAgentTimestamp[msg.chat_jid] = msg.timestamp;
-    // Strip <internal>...</internal> blocks — these are agent reasoning, not user-facing
-    const cleaned = response.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-    if (cleaned) {
-      await sendMessage(msg.chat_jid, `${ASSISTANT_NAME}: ${cleaned}`);
-    }
-  }
-}
-
-async function runAgent(group: RegisteredGroup, prompt: string, chatJid: string): Promise<string | null> {
-  const isMain = group.folder === MAIN_GROUP_FOLDER;
-  const sessionId = sessions[group.folder];
-
-  // Update tasks snapshot for container to read
-  const tasks = getAllTasks();
-  writeTasksSnapshot(
-    group.folder,
-    isMain,
-    tasks.map(t => ({
-      id: t.id,
-      groupFolder: t.group_folder,
-      prompt: t.prompt,
-      schedule_type: t.schedule_type,
-      schedule_value: t.schedule_value,
-      status: t.status,
-      next_run: t.next_run
-    })),
-  );
-
-  // Update available groups snapshot (main group can see all WhatsApp groups)
-  const availableGroups = getAvailableGroups();
-  const registeredJids = new Set(Object.keys(registeredGroups));
-  writeGroupsSnapshot(group.folder, isMain, availableGroups, registeredJids);
-
-  try {
-    const output = await runContainerAgent(group, {
-      prompt,
-      sessionId,
-      groupFolder: group.folder,
-      chatJid,
-      isMain,
-    });
-
-    if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
-    }
-
-    if (output.status === 'error') {
-      logger.error({ group: group.name, error: output.error }, 'Container agent error');
-      return null;
-    }
-
-    return output.result;
-  } catch (err) {
-    logger.error({ group: group.name, err }, 'Agent error');
-    return null;
-  }
-}
-
-type SendOutcome = 'sent' | 'skipped' | 'unknown';
-
-async function sendMessage(jid: string, text: string): Promise<SendOutcome> {
-  const permit = accountSafety.reserve('message');
-  if (!permit.allowed) {
-    logger.warn({ jid, permit }, 'Outbound message skipped by account safety controller');
-    return 'skipped';
-  }
-
-  try {
-    await withActionTimeout(sock.sendMessage(jid, { text }), WHATSAPP_ACTION_TIMEOUT_MS);
-    accountSafety.recordSuccess();
-    logger.info({ jid, length: text.length }, 'Message sent');
-    return 'sent';
-  } catch (err) {
-    const circuitOpened = accountSafety.recordFailure();
-    logger.error({ jid, err }, 'Failed to send message');
-    if (circuitOpened) logger.error(accountSafety.snapshot(), 'Account safety circuit opened');
-    return 'unknown';
-  }
-}
-
-function extractMessageText(msg: Parameters<typeof moderateMessage>[0]): string {
-  const message = msg.message;
-  if (!message) return '';
-  return (
-    message.conversation ||
-    message.extendedTextMessage?.text ||
-    message.imageMessage?.caption ||
-    message.videoMessage?.caption ||
-    ''
-  );
-}
-
-async function processPlaygroundMessage(
-  msg: Parameters<typeof moderateMessage>[0],
-  chatJid: string,
-  group: RegisteredGroup,
-): Promise<void> {
-  const config = group.playground;
-  const key = msg.key;
-  if (!PUBLIC_PLAYGROUND_ENABLED || !config?.enabled || !key || key.fromMe) return;
-
-  const messageId = key.id || '';
-  const senderJid = key.participant || '';
-  if (!messageId || !senderJid) return;
-
-  const text = extractMessageText(msg);
-  const command = parsePlaygroundCommand(text, group.trigger);
-  if (!command) return;
-
-  const eventKey = `playground:${chatJid}:${messageId}`;
-  let actorHash: string;
-  try {
-    actorHash = hashPlaygroundActor(senderJid);
-  } catch (err) {
-    logger.error({ err }, 'Playground audit key unavailable; command refused');
-    return;
-  }
-  const now = Date.now();
-  const timestamp = new Date(now).toISOString();
-  const claimed = claimPlaygroundEvent({
-    event_key: eventKey,
-    chat_jid: chatJid,
-    message_id: messageId,
-    actor_hash: actorHash,
-    command,
-    timestamp,
-  });
-  if (!claimed) {
-    logger.debug({ eventKey }, 'Duplicate playground command ignored');
-    return;
-  }
-
-  const durableUsage = getPlaygroundRateUsage({
-    chatJid,
-    actorHash,
-    actorSince: new Date(now - config.cooldownSeconds * 1_000).toISOString(),
-    groupSince: new Date(now - 60_000).toISOString(),
-  });
-  if (durableUsage.actorResponses > 1) {
-    finishPlaygroundEvent(eventKey, 'cooldown');
-    return;
-  }
-  if (durableUsage.groupResponses > config.maxResponsesPerMinute) {
-    finishPlaygroundEvent(eventKey, 'group-budget');
-    return;
-  }
-
-  const reply = playgroundResponder.respond({
-    chatJid,
-    senderJid,
-    text,
-    trigger: group.trigger,
-    config,
-    now,
-  });
-  if (!reply || !reply.text) {
-    finishPlaygroundEvent(eventKey, reply?.outcome || 'cooldown');
-    return;
-  }
-
-  const sendOutcome = await sendMessage(chatJid, reply.text);
-  const outcome = sendOutcome === 'sent' ? 'served' : sendOutcome;
-  finishPlaygroundEvent(eventKey, outcome);
-  logger.info({ chatJid, command: reply.command, outcome }, 'Playground command handled');
-}
-
-function startIpcWatcher(): void {
-  const ipcBaseDir = path.join(DATA_DIR, 'ipc');
-  fs.mkdirSync(ipcBaseDir, { recursive: true });
-
-  const processIpcFiles = async () => {
-    // Scan all group IPC directories (identity determined by directory)
-    let groupFolders: string[];
-    try {
-      groupFolders = fs.readdirSync(ipcBaseDir).filter(f => {
-        const stat = fs.statSync(path.join(ipcBaseDir, f));
-        return stat.isDirectory() && f !== 'errors';
-      });
-    } catch (err) {
-      logger.error({ err }, 'Error reading IPC base directory');
-      setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
-      return;
-    }
-
-    for (const sourceGroup of groupFolders) {
-      const isMain = sourceGroup === MAIN_GROUP_FOLDER;
-      const messagesDir = path.join(ipcBaseDir, sourceGroup, 'messages');
-      const tasksDir = path.join(ipcBaseDir, sourceGroup, 'tasks');
-
-      // Process messages from this group's IPC directory
-      try {
-        if (fs.existsSync(messagesDir)) {
-          const messageFiles = fs.readdirSync(messagesDir).filter(f => f.endsWith('.json'));
-          for (const file of messageFiles) {
-            const filePath = path.join(messagesDir, file);
-            try {
-              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              if (data.type === 'message' && data.chatJid && data.text) {
-                // Authorization: main group can send anywhere, others only to their own chat
-                const targetGroup = registeredGroups[data.chatJid];
-                if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
-                  await sendMessage(data.chatJid, `${ASSISTANT_NAME}: ${data.text}`);
-                  logger.info({ chatJid: data.chatJid, sourceGroup }, 'IPC message sent');
-                } else {
-                  logger.warn({ chatJid: data.chatJid, sourceGroup }, 'Unauthorized IPC message attempt blocked');
-                }
-              }
-              fs.unlinkSync(filePath);
-            } catch (err) {
-              logger.error({ file, sourceGroup, err }, 'Error processing IPC message');
-              const errorDir = path.join(ipcBaseDir, 'errors');
-              fs.mkdirSync(errorDir, { recursive: true });
-              fs.renameSync(filePath, path.join(errorDir, `${sourceGroup}-${file}`));
-            }
-          }
-        }
-      } catch (err) {
-        logger.error({ err, sourceGroup }, 'Error reading IPC messages directory');
-      }
-
-      // Process tasks from this group's IPC directory
-      try {
-        if (fs.existsSync(tasksDir)) {
-          const taskFiles = fs.readdirSync(tasksDir).filter(f => f.endsWith('.json'));
-          for (const file of taskFiles) {
-            const filePath = path.join(tasksDir, file);
-            try {
-              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              // Pass source group identity for authorization
-              await processTaskIpc(data, sourceGroup, isMain);
-              fs.unlinkSync(filePath);
-            } catch (err) {
-              logger.error({ file, sourceGroup, err }, 'Error processing IPC task');
-              const errorDir = path.join(ipcBaseDir, 'errors');
-              fs.mkdirSync(errorDir, { recursive: true });
-              fs.renameSync(filePath, path.join(errorDir, `${sourceGroup}-${file}`));
-            }
-          }
-        }
-      } catch (err) {
-        logger.error({ err, sourceGroup }, 'Error reading IPC tasks directory');
-      }
-    }
-
-    setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
-  };
-
-  processIpcFiles();
-  logger.info('IPC watcher started (per-group namespaces)');
-}
-
-async function processTaskIpc(
-  data: {
-    type: string;
-    taskId?: string;
-    prompt?: string;
-    schedule_type?: string;
-    schedule_value?: string;
-    context_mode?: string;
-    groupFolder?: string;
-    chatJid?: string;
-    // For register_group / update_group_config
-    jid?: string;
-    name?: string;
-    folder?: string;
-    trigger?: string;
-    containerConfig?: RegisteredGroup['containerConfig'];
-    guards?: RegisteredGroup['guards'];
-    moderationConfig?: RegisteredGroup['moderationConfig'];
-  },
-  sourceGroup: string,
-  isMain: boolean,
-): Promise<void> {
-  const { createTask, updateTask, deleteTask, getTaskById: getTask } = await import('./db.js');
-  const { CronExpressionParser } = await import('cron-parser');
-
-  switch (data.type) {
-    case 'schedule_task':
-      if (data.prompt && data.schedule_type && data.schedule_value && data.groupFolder) {
-        const targetGroup = data.groupFolder;
-
-        // Authorization: non-main groups can only schedule for themselves
-        if (!isMain && targetGroup !== sourceGroup) {
-          logger.warn({ sourceGroup, targetGroup }, 'Unauthorized schedule_task attempt blocked');
-          break;
-        }
-
-        // Resolve the correct JID for the target group
-        const targetJid = Object.entries(registeredGroups).find(
-          ([, group]) => group.folder === targetGroup
-        )?.[0];
-
-        if (!targetJid) {
-          logger.warn({ targetGroup }, 'Cannot schedule task: target group not registered');
-          break;
-        }
-
-        const scheduleType = data.schedule_type as 'cron' | 'interval' | 'once';
-
-        let nextRun: string | null = null;
-        if (scheduleType === 'cron') {
-          try {
-            const interval = CronExpressionParser.parse(data.schedule_value, { tz: TIMEZONE });
-            nextRun = interval.next().toISOString();
-          } catch {
-            logger.warn({ scheduleValue: data.schedule_value }, 'Invalid cron expression');
-            break;
-          }
-        } else if (scheduleType === 'interval') {
-          const ms = parseInt(data.schedule_value, 10);
-          if (isNaN(ms) || ms <= 0) {
-            logger.warn({ scheduleValue: data.schedule_value }, 'Invalid interval');
-            break;
-          }
-          nextRun = new Date(Date.now() + ms).toISOString();
-        } else if (scheduleType === 'once') {
-          const scheduled = new Date(data.schedule_value);
-          if (isNaN(scheduled.getTime())) {
-            logger.warn({ scheduleValue: data.schedule_value }, 'Invalid timestamp');
-            break;
-          }
-          nextRun = scheduled.toISOString();
-        }
-
-        const taskId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        const contextMode = (data.context_mode === 'group' || data.context_mode === 'isolated')
-          ? data.context_mode
-          : 'isolated';
-        createTask({
-          id: taskId,
-          group_folder: targetGroup,
-          chat_jid: targetJid,
-          prompt: data.prompt,
-          schedule_type: scheduleType,
-          schedule_value: data.schedule_value,
-          context_mode: contextMode,
-          next_run: nextRun,
-          status: 'active',
-          created_at: new Date().toISOString()
-        });
-        logger.info({ taskId, sourceGroup, targetGroup, contextMode }, 'Task created via IPC');
-      }
-      break;
-
-    case 'pause_task':
-      if (data.taskId) {
-        const task = getTask(data.taskId);
-        if (task && (isMain || task.group_folder === sourceGroup)) {
-          updateTask(data.taskId, { status: 'paused' });
-          logger.info({ taskId: data.taskId, sourceGroup }, 'Task paused via IPC');
-        } else {
-          logger.warn({ taskId: data.taskId, sourceGroup }, 'Unauthorized task pause attempt');
-        }
-      }
-      break;
-
-    case 'resume_task':
-      if (data.taskId) {
-        const task = getTask(data.taskId);
-        if (task && (isMain || task.group_folder === sourceGroup)) {
-          updateTask(data.taskId, { status: 'active' });
-          logger.info({ taskId: data.taskId, sourceGroup }, 'Task resumed via IPC');
-        } else {
-          logger.warn({ taskId: data.taskId, sourceGroup }, 'Unauthorized task resume attempt');
-        }
-      }
-      break;
-
-    case 'cancel_task':
-      if (data.taskId) {
-        const task = getTask(data.taskId);
-        if (task && (isMain || task.group_folder === sourceGroup)) {
-          deleteTask(data.taskId);
-          logger.info({ taskId: data.taskId, sourceGroup }, 'Task cancelled via IPC');
-        } else {
-          logger.warn({ taskId: data.taskId, sourceGroup }, 'Unauthorized task cancel attempt');
-        }
-      }
-      break;
-
-    case 'refresh_groups':
-      // Only main group can request a refresh
-      if (isMain) {
-        logger.info({ sourceGroup }, 'Group metadata refresh requested via IPC');
-        await syncGroupMetadata(true);
-        // Write updated snapshot immediately
-        const availableGroups = getAvailableGroups();
-        const registeredJids = new Set(Object.keys(registeredGroups));
-        const { writeGroupsSnapshot: writeGroups } = await import('./container-runner.js');
-        writeGroups(sourceGroup, true, availableGroups, registeredJids);
-      } else {
-        logger.warn({ sourceGroup }, 'Unauthorized refresh_groups attempt blocked');
-      }
-      break;
-
-    case 'register_group':
-      // Only main group can register new groups
-      if (!isMain) {
-        logger.warn({ sourceGroup }, 'Unauthorized register_group attempt blocked');
-        break;
-      }
-      if (data.jid && data.name && data.folder && data.trigger) {
-        registerGroup(data.jid, {
-          name: data.name,
-          folder: data.folder,
-          trigger: data.trigger,
-          added_at: new Date().toISOString(),
-          containerConfig: data.containerConfig,
-          guards: data.guards,
-          moderationConfig: data.moderationConfig,
-        });
-      } else {
-        logger.warn({ data }, 'Invalid register_group request - missing required fields');
-      }
-      break;
-
-    case 'update_group_config':
-      // Only main group can update guard/moderation configs
-      if (!isMain) {
-        logger.warn({ sourceGroup }, 'Unauthorized update_group_config attempt blocked');
-        break;
-      }
-      if (data.jid && registeredGroups[data.jid]) {
-        const current = registeredGroups[data.jid];
-        const parsed = registeredGroupSchema.safeParse({
-          ...current,
-          guards: data.guards ?? current.guards,
-          moderationConfig: data.moderationConfig ?? current.moderationConfig,
-        });
-        if (!parsed.success) {
-          logger.warn(
-            { jid: data.jid, errors: parsed.error.issues },
-            'Unsafe group config update rejected',
-          );
-          break;
-        }
-        registeredGroups[data.jid] = parsed.data;
-        saveJson(path.join(DATA_DIR, 'registered_groups.json'), registeredGroups);
-        logger.info(
-          {
-            jid: data.jid,
-            guards: parsed.data.guards.length,
-            observationMode: parsed.data.moderationConfig.observationMode,
-          },
-          'Group config updated via IPC',
-        );
-      } else {
-        logger.warn({ jid: data.jid }, 'update_group_config: group not found');
-      }
-      break;
-
-    default:
-      logger.warn({ type: data.type }, 'Unknown IPC task type');
-  }
-}
-
-function stopForOperator(message: string, context?: Record<string, unknown>): never {
-  logger.fatal(context || {}, message);
-  // A clean exit tells systemd and launchd not to create a reconnect loop.
-  process.exit(0);
-}
-
-function scheduleReconnect(reason: unknown): void {
-  if (reconnectTimer) return;
-
-  if (reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
-    stopForOperator(
-      'WhatsApp reconnect budget exhausted; stopping to protect the account',
-      { reason, reconnectAttempts },
-    );
-  }
-
-  const exponentialDelay = Math.min(
-    RECONNECT_MAX_DELAY_MS,
-    RECONNECT_BASE_DELAY_MS * 2 ** reconnectAttempts,
-  );
-  const jitter = Math.floor(Math.random() * Math.max(250, exponentialDelay * 0.25));
-  const delayMs = exponentialDelay + jitter;
-  reconnectAttempts += 1;
-
-  logger.warn(
-    { reason, reconnectAttempts, maxAttempts: RECONNECT_MAX_ATTEMPTS, delayMs },
-    'WhatsApp connection closed; reconnect scheduled',
-  );
-
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = undefined;
-    connectWhatsApp().catch((err) => {
-      logger.error({ err }, 'WhatsApp reconnect attempt failed');
-      scheduleReconnect(err);
-    });
-  }, delayMs);
-}
-
-async function connectWhatsApp(): Promise<void> {
-  const authDir = path.join(STORE_DIR, 'auth');
-  fs.mkdirSync(authDir, { recursive: true });
-
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
-
-  const currentSocket = makeWASocket({
-    auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
-    printQRInTerminal: false,
-    logger,
-    browser: ['GroupGuard', 'Chrome', '1.0.0']
-  });
-  sock = currentSocket;
-
-  currentSocket.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      stopForOperator('WhatsApp authentication required. Run npm run auth, then restart GroupGuard.');
-    }
-
-    if (connection === 'close') {
-      if (currentSocket !== sock) return;
-      if (stableConnectionTimer) clearTimeout(stableConnectionTimer);
-
-      const reason = (lastDisconnect?.error as any)?.output?.statusCode;
-      if (reason === DisconnectReason.loggedOut) {
-        stopForOperator('WhatsApp logged out. Run npm run auth before restarting.');
-      }
-
-      scheduleReconnect(reason);
-    } else if (connection === 'open') {
-      logger.info('Connected to WhatsApp');
-
-      // A connection must remain healthy before it earns a fresh retry budget.
-      stableConnectionTimer = setTimeout(() => {
-        reconnectAttempts = 0;
-        logger.debug('WhatsApp connection stable; reconnect budget reset');
-      }, 2 * 60 * 1000);
-
-      // Initialize moderation system
-      initModerator(currentSocket, accountSafety);
-
-      // Refresh admin caches for all registered groups
-      for (const chatJid of Object.keys(registeredGroups)) {
-        if (chatJid.endsWith('@g.us')) {
-          refreshAdminCache(chatJid).catch(err =>
-            logger.warn({ chatJid, err }, 'Failed to refresh admin cache on startup')
-          );
-        }
-      }
-
-      // Sync group metadata after every connection (respects 24h cache).
-      syncGroupMetadata().catch(err => logger.error({ err }, 'Initial group sync failed'));
-
-      if (!backgroundLoopsStarted) {
-        backgroundLoopsStarted = true;
-        setInterval(() => {
-          syncGroupMetadata().catch(err => logger.error({ err }, 'Periodic group sync failed'));
-        }, GROUP_SYNC_INTERVAL_MS);
-
-        if (AGENT_ENABLED) {
-          startSchedulerLoop({
-            sendMessage: async (jid, text) => {
-              await sendMessage(jid, text);
-            },
-            registeredGroups: () => registeredGroups,
-            getSessions: () => sessions
-          });
-          startIpcWatcher();
-          startMessageLoop();
-        } else {
-          logger.info('Moderation-only mode active; Docker and AI agent features are disabled');
-        }
-      }
-    }
-  });
-
-  currentSocket.ev.on('creds.update', saveCreds);
-
-  currentSocket.ev.on('messages.upsert', async ({ messages }) => {
-    for (const msg of messages) {
-      if (!msg.message) continue;
-      const chatJid = msg.key.remoteJid;
-      if (!chatJid || chatJid === 'status@broadcast') continue;
-
-      // Skip protocol messages (deletions, edits, reactions, etc.) — not real content
-      if (msg.message.protocolMessage || msg.message.reactionMessage || msg.message.editedMessage) continue;
-
-      const timestamp = new Date(Number(msg.messageTimestamp) * 1000).toISOString();
-
-      // Always store chat metadata for group discovery
-      storeChatMetadata(chatJid, timestamp);
-
-      // Process messages for registered groups
-      if (registeredGroups[chatJid]) {
-        const group = registeredGroups[chatJid];
-
-        // The public surface stores only fixed-command audit events. It never
-        // sends visitor content through moderation, message history, or AI.
-        if (PUBLIC_PLAYGROUND_ENABLED && group.playground?.enabled) {
-          await processPlaygroundMessage(msg, chatJid, group);
-          continue;
-        }
-
-        // Run moderation guards BEFORE storing the message
-        if (group?.guards && group.guards.length > 0 && chatJid.endsWith('@g.us')) {
-          const blocked = await moderateMessage(
-            msg,
-            chatJid,
-            group.guards,
-            group.moderationConfig,
-          );
-          if (blocked) continue; // Skip storing blocked messages
-        }
-
-        storeMessage(msg, chatJid, msg.key.fromMe || false, msg.pushName || undefined);
-      }
-    }
-  });
-
-  // Track group membership changes for admin cache updates
-  currentSocket.ev.on('group-participants.update', async ({ id, participants, action }) => {
-    logger.info({ chatJid: id, action, count: participants.length }, 'Group participants updated');
-
-    // Refresh admin cache when participants change
-    if (registeredGroups[id]) {
-      await refreshAdminCache(id);
-    }
-  });
-}
-
-async function startMessageLoop(): Promise<void> {
-  if (messageLoopRunning) {
-    logger.debug('Message loop already running, skipping duplicate start');
-    return;
-  }
-  messageLoopRunning = true;
-  logger.info(`GroupGuard running (trigger: @${ASSISTANT_NAME})`);
-
-  while (true) {
-    try {
-      const registeredJids = Object.keys(registeredGroups);
-      const { messages } = getNewMessages(registeredJids, lastTimestamp, ASSISTANT_NAME);
-
-      if (messages.length > 0) logger.info({ count: messages.length }, 'New messages');
-      for (const msg of messages) {
-        try {
-          await processMessage(msg);
-          // Only advance timestamp after successful processing for at-least-once delivery
-          lastTimestamp = msg.timestamp;
-          saveState();
-        } catch (err) {
-          logger.error({ err, msg: msg.id }, 'Error processing message, will retry');
-          // Stop processing this batch - failed message will be retried next loop
-          break;
-        }
-      }
-    } catch (err) {
-      logger.error({ err }, 'Error in message loop');
-    }
-    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
-  }
-}
-
-function ensureRuntimeRunning(): void {
-  if (!AGENT_ENABLED) {
-    logger.info('Docker check skipped because the optional agent is disabled');
-    return;
-  }
-
-  try {
-    execSync('docker info', { stdio: 'pipe', timeout: 10000 });
-    logger.debug('Docker is running');
-  } catch {
-    console.error('\n╔════════════════════════════════════════════════════╗');
-    console.error('║  FATAL: Docker is not running                      ║');
-    console.error('║                                                    ║');
-    console.error('║  GroupGuard requires Docker to run agents.         ║');
-    console.error('║  • macOS: Start Docker Desktop                     ║');
-    console.error('║  • Linux: sudo systemctl start docker              ║');
-    console.error('╚════════════════════════════════════════════════════╝\n');
-    throw new Error('Docker is required but not running');
-  }
-
-  // Kill and clean up orphaned containers from previous runs
-  try {
-    const output = execSync(
-      'docker ps --filter "name=groupguard-" --format "{{.Names}}"',
-      { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
-    );
-    const orphans = output.trim().split('\n').filter(Boolean);
-    for (const name of orphans) {
-      try { execSync(`docker stop ${name}`, { stdio: 'pipe' }); } catch { /* already stopped */ }
-    }
-    if (orphans.length > 0) {
-      logger.info({ count: orphans.length, names: orphans }, 'Stopped orphaned containers');
-    }
-  } catch (err) {
-    logger.warn({ err }, 'Failed to clean up orphaned containers');
-  }
-}
+  initChannelAdapters,
+  teardownChannelAdapters,
+  createChannelDeliveryAdapter,
+} from './channels/channel-registry.js';
 
 async function main(): Promise<void> {
-  ensureRuntimeRunning();
-  initDatabase();
-  logger.info('Database initialized');
-  loadState();
-  await connectWhatsApp();
+  log.info('NanoClaw starting');
+
+  // 0. Circuit breaker — backoff on rapid restarts
+  await enforceStartupBackoff();
+
+  // 0.5 Upgrade tripwire — refuse to start if this install was updated
+  // outside the sanctioned path (raw `git pull` instead of /update-nanoclaw).
+  enforceUpgradeTripwire();
+
+  // 1. Init central DB
+  const db = await initDb(CENTRAL_DB_PATH, { role: 'host' });
+  await runMigrations(db, undefined, { mode: 'auto' });
+  log.info('Central DB ready', { dialect: db.dialect });
+
+  // 1b. Backfill container_configs from legacy container.json files.
+  // Idempotent — skips groups that already have a config row.
+  if (db.dialect === 'sqlite') await backfillContainerConfigs();
+  else log.info('Skipping local container.json backfill for non-local central DB');
+
+  // 2. Session runtime: prove it is reachable, then reconcile what survived a
+  // restart. Adoption replaces the old reap-everything cleanup — a session that
+  // is still running keeps running, and only true orphans are stopped.
+  await getSessionDriver().ensureReady?.();
+  await adoptRunningSessions();
+
+  // 3. Channel adapters
+  await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
+    return {
+      onInbound(platformId, threadId, message) {
+        routeInbound({
+          channelType: adapter.channelType,
+          // The one host-side stamping seam: adapters stay instance-blind,
+          // the host stamps the receiving instance on every inbound event.
+          instance: adapter.instance ?? adapter.channelType,
+          platformId,
+          threadId,
+          message: {
+            id: message.id,
+            kind: message.kind,
+            content: JSON.stringify(message.content),
+            timestamp: message.timestamp,
+            isMention: message.isMention,
+            isGroup: message.isGroup,
+          },
+        }).catch((err) => {
+          log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
+        });
+      },
+      onInboundEvent(event) {
+        routeInbound(event).catch((err) => {
+          log.error('Failed to route inbound event', {
+            sourceAdapter: adapter.channelType,
+            targetChannelType: event.channelType,
+            err,
+          });
+        });
+      },
+      onMetadata(platformId, name, isGroup) {
+        log.info('Channel metadata discovered', {
+          channelType: adapter.channelType,
+          platformId,
+          name,
+          isGroup,
+        });
+      },
+      onAction(questionId, selectedOption, userId) {
+        dispatchResponse({
+          questionId,
+          value: selectedOption,
+          userId,
+          channelType: adapter.channelType,
+          // platformId/threadId aren't surfaced by the current onAction
+          // signature — registered handlers look them up from the
+          // pending_question / pending_approval row.
+          platformId: '',
+          threadId: null,
+        }).catch((err) => {
+          log.error('Failed to handle question response', { questionId, err });
+        });
+      },
+    };
+  });
+
+  // 4. Delivery adapter bridge — dispatches to channel adapters by EXACT
+  // registry key (instance ?? channelType): a named instance with an
+  // offline adapter is never rerouted through a sibling bot. See
+  // createChannelDeliveryAdapter in channels/channel-registry.ts.
+  setDeliveryAdapter(createChannelDeliveryAdapter());
+
+  // 5. Start registered host modules. Imports only registered callbacks; the
+  // actual work begins here, after DB + delivery are ready and before polls.
+  await startHostModules({ db, signal: hostAbortController.signal });
+
+  // 6. Start delivery polls
+  startActiveDeliveryPoll();
+  startSweepDeliveryPoll();
+  log.info('Delivery polls started');
+
+  // 7. Start host sweep
+  startHostSweep();
+  log.info('Host sweep started');
+
+  // 8. Start the `ncl` CLI socket server (data/ncl.sock).
+  await startCliServer();
+
+  log.info('NanoClaw running');
 }
 
-main().catch(err => {
-  logger.error({ err }, 'Failed to start GroupGuard');
+/** Graceful shutdown. */
+async function shutdown(signal: string): Promise<void> {
+  log.info('Shutdown signal received', { signal });
+  hostAbortController.abort();
+  await stopHostModules();
+  stopDeliveryPolls();
+  stopHostSweep();
+  await stopCliServer();
+  try {
+    await teardownChannelAdapters();
+  } finally {
+    await closeDb();
+    // Always reset on graceful shutdown — even if teardown threw, we got here
+    // via SIGTERM/SIGINT, not a crash, so the next start shouldn't be counted
+    // as one.
+    resetCircuitBreaker();
+    process.exit(0);
+  }
+}
+
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
+
+main().catch((err) => {
+  log.fatal('Startup failed', { err });
   process.exit(1);
 });

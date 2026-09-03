@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "directory": {
+    "taxonomyPath": "config/taxonomy.json",
+    "source": "config/directory.json",
+    "cachePath": "data/groupguard/directory-cache.json",
+    "model": "qwen3:4b",
+    "ollamaBaseUrl": "http://127.0.0.1:11434",
+    "minimumConfidence": 0.72,
+    "refreshHours": 24,
+    "keepAlive": "25h"
+  },
+  "groups": {
+    "123456789012345678@g.us": {
+      "directoryEnabled": true,
+      "forwardUnmatchedToAgent": false,
+      "moderation": {
+        "observationMode": true,
+        "adminExempt": true,
+        "notifyOnDelete": false,
+        "minimumObservationHours": 24,
+        "observationStartedAt": "2026-01-01T00:00:00.000Z",
+        "guards": [
+          {
+            "id": "no-spam",
+            "enabled": true,
+            "params": {
+              "maxMessages": 5,
+              "windowSeconds": 10
+            }
+          }
+        ]
+      }
+    }
+  }
+}

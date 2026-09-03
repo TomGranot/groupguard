@@ -1,142 +1,109 @@
-import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
+import { readEnvFile } from './env.js';
+import { getContainerImageBase, getDefaultContainerImage, getInstallSlug } from './install-slug.js';
+import { isValidTimezone } from './timezone.js';
+
+// Read config values from .env (falls back to process.env).
+const envConfig = readEnvFile([
+  'ASSISTANT_NAME',
+  'ASSISTANT_HAS_OWN_NUMBER',
+  'ONECLI_URL',
+  'ONECLI_API_KEY',
+  'TZ',
+  'DEFAULT_AGENT_PROVIDER',
+  'CONTAINER_CPU_LIMIT',
+  'CONTAINER_MEMORY_LIMIT',
+  'CONTAINER_PIDS_LIMIT',
+  'NANOCLAW_EGRESS_LOCKDOWN',
+  'NANOCLAW_EGRESS_NETWORK',
+  'ONECLI_GATEWAY_CONTAINER',
+]);
+
 /**
- * Load local runtime settings without adding another dependency. Existing
- * environment variables win so service managers and containers can override
- * the file safely.
+ * @deprecated WhatsApp adapter copies now read the ASSISTANT_NAME .env key
+ * directly. Re-export retained one release for stale adapter copies
+ * (origin/channels whatsapp.ts:42 imports it); scheduled for deletion.
  */
-function loadLocalEnv(): void {
-  const envPath = path.resolve(process.cwd(), '.env');
-  if (!fs.existsSync(envPath)) return;
+export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
 
-  for (const line of fs.readFileSync(envPath, 'utf-8').split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
+// Instance-wide default agent provider for newly created groups. `claude` (the
+// built-in provider) when unset, so existing installs are unaffected on upgrade.
+// Applied only at group-creation time (stamped onto the config row) — never in
+// provider resolution — so existing groups are never retroactively flipped.
+// Per-group `ncl groups config update --provider` still overrides it.
+export const DEFAULT_AGENT_PROVIDER = (
+  process.env.DEFAULT_AGENT_PROVIDER ||
+  envConfig.DEFAULT_AGENT_PROVIDER ||
+  'claude'
+).toLowerCase();
 
-    const separator = trimmed.indexOf('=');
-    if (separator <= 0) continue;
-
-    const key = trimmed.slice(0, separator).trim();
-    let value = trimmed.slice(separator + 1).trim();
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
-
-    if (process.env[key] === undefined) process.env[key] = value;
-  }
-}
-
-function booleanSetting(name: string, fallback: boolean): boolean {
-  const value = process.env[name];
-  if (value === undefined || value === '') return fallback;
-  if (['1', 'true', 'yes', 'on'].includes(value.toLowerCase())) return true;
-  if (['0', 'false', 'no', 'off'].includes(value.toLowerCase())) return false;
-  throw new Error(`${name} must be true or false`);
-}
-
-function integerSetting(
-  name: string,
-  fallback: number,
-  minimum = 1,
-  maximum = Number.MAX_SAFE_INTEGER,
-): number {
-  const value = process.env[name];
-  if (value === undefined || value === '') return fallback;
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
-    throw new Error(`${name} must be an integer from ${minimum} to ${maximum}`);
-  }
-  return parsed;
-}
-
-loadLocalEnv();
-
-export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || 'GroupGuard';
-export const POLL_INTERVAL = 2000;
-export const SCHEDULER_POLL_INTERVAL = 60000;
-
-// Safe product defaults. Moderation works without Docker or an AI provider.
-export const AGENT_ENABLED = booleanSetting('GROUPGUARD_AGENT_ENABLED', false);
-export const ENFORCEMENT_ENABLED = booleanSetting('GROUPGUARD_ENFORCEMENT_ENABLED', false);
-export const AGENT_PROJECT_WRITE_ENABLED = booleanSetting('GROUPGUARD_AGENT_PROJECT_WRITE_ENABLED', false);
-export const MIN_OBSERVATION_HOURS = integerSetting('GROUPGUARD_MIN_OBSERVATION_HOURS', 24, 1, 720);
-export const ALLOW_REGEX_FILTERS = booleanSetting('GROUPGUARD_ALLOW_REGEX_FILTERS', false);
-export const TYPING_INDICATOR_ENABLED = booleanSetting('GROUPGUARD_TYPING_INDICATOR_ENABLED', false);
-export const PUBLIC_PLAYGROUND_ENABLED = booleanSetting('GROUPGUARD_PUBLIC_PLAYGROUND_ENABLED', false);
-
-// Account-level action budgets. These are conservative product limits, not
-// published WhatsApp limits. Operators may lower them, but should raise them
-// only after a stable observation period.
-export const MAX_OUTBOUND_MESSAGES_PER_MINUTE = integerSetting(
-  'GROUPGUARD_MAX_OUTBOUND_MESSAGES_PER_MINUTE',
-  8,
-  1,
-  100,
-);
-export const MAX_MODERATION_ACTIONS_PER_MINUTE = integerSetting(
-  'GROUPGUARD_MAX_MODERATION_ACTIONS_PER_MINUTE',
-  12,
-  1,
-  120,
-);
-export const MAX_MODERATION_DMS_PER_HOUR = integerSetting(
-  'GROUPGUARD_MAX_MODERATION_DMS_PER_HOUR',
-  6,
-  1,
-  100,
-);
-export const SAFETY_FAILURE_THRESHOLD = integerSetting('GROUPGUARD_SAFETY_FAILURE_THRESHOLD', 3, 1, 10);
-export const SAFETY_CIRCUIT_COOLDOWN_MS = integerSetting(
-  'GROUPGUARD_SAFETY_CIRCUIT_COOLDOWN_MS',
-  15 * 60 * 1000,
-  60_000,
-  24 * 60 * 60 * 1000,
-);
-export const WHATSAPP_ACTION_TIMEOUT_MS = integerSetting(
-  'GROUPGUARD_WHATSAPP_ACTION_TIMEOUT_MS',
-  15 * 1000,
-  1_000,
-  60_000,
-);
-
-export const RECONNECT_MAX_ATTEMPTS = integerSetting('GROUPGUARD_RECONNECT_MAX_ATTEMPTS', 8, 1, 20);
-export const RECONNECT_BASE_DELAY_MS = integerSetting('GROUPGUARD_RECONNECT_BASE_DELAY_MS', 1000, 250, 60_000);
-export const RECONNECT_MAX_DELAY_MS = integerSetting(
-  'GROUPGUARD_RECONNECT_MAX_DELAY_MS',
-  60 * 1000,
-  1_000,
-  10 * 60 * 1000,
-);
-if (RECONNECT_MAX_DELAY_MS < RECONNECT_BASE_DELAY_MS) {
-  throw new Error('GROUPGUARD_RECONNECT_MAX_DELAY_MS must be at least the base delay');
-}
+/**
+ * @deprecated WhatsApp adapter copies now read the ASSISTANT_HAS_OWN_NUMBER
+ * .env key directly. Re-export retained one release for stale adapter copies
+ * (origin/channels whatsapp.ts:42 imports it); scheduled for deletion.
+ */
+export const ASSISTANT_HAS_OWN_NUMBER =
+  (process.env.ASSISTANT_HAS_OWN_NUMBER || envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
 
 // Absolute paths needed for container mounts
 const PROJECT_ROOT = process.cwd();
-const HOME_DIR = process.env.HOME || '/Users/user';
+const HOME_DIR = process.env.HOME || os.homedir();
 
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers
-export const MOUNT_ALLOWLIST_PATH = path.join(HOME_DIR, '.config', 'groupguard', 'mount-allowlist.json');
+export const MOUNT_ALLOWLIST_PATH = path.join(HOME_DIR, '.config', 'nanoclaw', 'mount-allowlist.json');
+export const SENDER_ALLOWLIST_PATH = path.join(HOME_DIR, '.config', 'nanoclaw', 'sender-allowlist.json');
 export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
 export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
-export const MAIN_GROUP_FOLDER = 'main';
+export const CENTRAL_DB_PATH = path.join(DATA_DIR, 'v2.db');
+// Local agent-template library. Committed but ships empty (+ README). Resolved
+// once at load. Override to another LOCAL path via NANOCLAW_TEMPLATES_DIR; never
+// a remote URL, never an ncl flag, never runtime-mutable.
+export const TEMPLATES_DIR = process.env.NANOCLAW_TEMPLATES_DIR
+  ? path.resolve(process.env.NANOCLAW_TEMPLATES_DIR)
+  : path.resolve(PROJECT_ROOT, 'templates');
 
-export const CONTAINER_IMAGE = process.env.CONTAINER_IMAGE || 'groupguard-agent:latest';
-export const CONTAINER_TIMEOUT = parseInt(process.env.CONTAINER_TIMEOUT || '300000', 10);
-export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760', 10); // 10MB default
-export const IPC_POLL_INTERVAL = 1000;
+// Per-checkout image tag so two installs on the same host don't share
+// `nanoclaw-agent:latest` and clobber each other on rebuild.
+export const CONTAINER_IMAGE_BASE = process.env.CONTAINER_IMAGE_BASE || getContainerImageBase(PROJECT_ROOT);
+export const CONTAINER_IMAGE = process.env.CONTAINER_IMAGE || getDefaultContainerImage(PROJECT_ROOT);
+// Install slug — the session key's install component, stamped onto every
+// runtime object via the canonical `nanoclaw-install` label so adoption and
+// reaping only ever see this install's sessions, not a peer's.
+export const INSTALL_SLUG = getInstallSlug(PROJECT_ROOT);
+export const CONTAINER_INSTALL_LABEL = `nanoclaw-install=${INSTALL_SLUG}`;
+export const ONECLI_URL = process.env.ONECLI_URL || envConfig.ONECLI_URL;
+export const ONECLI_API_KEY = process.env.ONECLI_API_KEY || envConfig.ONECLI_API_KEY;
+// Per-container resource caps, passed through to `docker run`. Default empty =
+// no flag added = today's unbounded behavior (don't OOM existing OSS workloads).
+// Operators opt in: CONTAINER_CPU_LIMIT=2, CONTAINER_MEMORY_LIMIT=8g.
+export const CONTAINER_CPU_LIMIT = process.env.CONTAINER_CPU_LIMIT || envConfig.CONTAINER_CPU_LIMIT || '';
+export const CONTAINER_MEMORY_LIMIT = process.env.CONTAINER_MEMORY_LIMIT || envConfig.CONTAINER_MEMORY_LIMIT || '';
 
-function escapeRegex(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// Fork-bomb backstop. cgroups v2 counts THREADS, not processes, and Chromium is
+// thread-hungry — a browsing agent with several tabs open runs into the high
+// hundreds. Keep well above that; too low a cap kills the container mid-turn or
+// blocks it from spawning subprocesses, and neither is reported as a PID limit.
+// Empty = no cap.
+export const CONTAINER_PIDS_LIMIT = process.env.CONTAINER_PIDS_LIMIT ?? envConfig.CONTAINER_PIDS_LIMIT ?? '2048';
+
+// Egress lockdown — force all agent traffic through the OneCLI gateway on a
+// no-internet Docker network. Off by default; consumed by src/egress-lockdown.ts.
+export const EGRESS_LOCKDOWN = (process.env.NANOCLAW_EGRESS_LOCKDOWN || envConfig.NANOCLAW_EGRESS_LOCKDOWN) === 'true';
+export const EGRESS_NETWORK =
+  process.env.NANOCLAW_EGRESS_NETWORK || envConfig.NANOCLAW_EGRESS_NETWORK || 'nanoclaw-egress';
+export const ONECLI_GATEWAY_CONTAINER =
+  process.env.ONECLI_GATEWAY_CONTAINER || envConfig.ONECLI_GATEWAY_CONTAINER || 'onecli';
+
+// Timezone for scheduled tasks, message formatting, etc.
+// Validates each candidate is a real IANA identifier before accepting.
+function resolveConfigTimezone(): string {
+  const candidates = [process.env.TZ, envConfig.TZ, Intl.DateTimeFormat().resolvedOptions().timeZone];
+  for (const tz of candidates) {
+    if (tz && isValidTimezone(tz)) return tz;
+  }
+  return 'UTC';
 }
-
-export const TRIGGER_PATTERN = new RegExp(`^@${escapeRegex(ASSISTANT_NAME)}\\b`, 'i');
-
-// Timezone for scheduled tasks (cron expressions, etc.)
-// Uses system timezone by default
-export const TIMEZONE = process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+export const TIMEZONE = resolveConfigTimezone();

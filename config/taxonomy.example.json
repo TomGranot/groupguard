@@ -1,0 +1,20 @@
+{
+  "version": "example-1",
+  "categories": [
+    {
+      "id": "home-repair",
+      "title": "Home repair",
+      "aliases": ["handyman", "repair service"],
+      "examples": [
+        "Can anyone recommend somebody to repair a broken cabinet?",
+        "I need help fixing a door."
+      ]
+    },
+    {
+      "id": "wellness",
+      "title": "Wellness",
+      "aliases": ["wellness professional"],
+      "examples": ["I am looking for a wellness professional nearby."]
+    }
+  ]
+}
