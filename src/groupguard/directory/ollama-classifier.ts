@@ -1,4 +1,10 @@
-import { normalizeDirectoryRequest, type CategoryClassification, type CategoryClassifier, type Taxonomy } from './responder.js';
+import { findCategoryCandidates, hasProviderRequestEvidence } from './request-policy.js';
+import {
+  normalizeDirectoryRequest,
+  type CategoryClassification,
+  type CategoryClassifier,
+  type Taxonomy,
+} from './responder.js';
 
 type FetchImplementation = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
@@ -19,6 +25,7 @@ function closedTaxonomyPrompt(taxonomy: Taxonomy): string {
   const categories = taxonomy.categories.map((category) => ({
     id: category.id,
     title: category.title,
+    aliases: category.aliases,
     examples: category.examples ?? [],
   }));
   return [
@@ -26,6 +33,8 @@ function closedTaxonomyPrompt(taxonomy: Taxonomy): string {
     'Choose exactly one category ID from the closed list below.',
     'Return null when the message is not a service-provider request or when the category is uncertain.',
     'Do not invent categories. Do not answer the message.',
+    'Reject advice, experiences, prices, offers, advertisements, hypothetical examples, and discussion of the bot.',
+    'Private contact preferences are not evidence for a private service. Choose the service actually requested.',
     'Return only JSON with categoryId and confidence.',
     `Taxonomy version: ${taxonomy.version}`,
     JSON.stringify(categories),
@@ -33,7 +42,10 @@ function closedTaxonomyPrompt(taxonomy: Taxonomy): string {
 }
 
 function parseClassification(content: string, taxonomy: Taxonomy): CategoryClassification | null {
-  const cleaned = content.trim().replace(/^```(?:json)?\s*/iu, '').replace(/\s*```$/u, '');
+  const cleaned = content
+    .trim()
+    .replace(/^```(?:json)?\s*/iu, '')
+    .replace(/\s*```$/u, '');
   let value: unknown;
   try {
     value = JSON.parse(cleaned);
@@ -68,7 +80,10 @@ export class OllamaCategoryClassifier implements CategoryClassifier {
   }
 
   async classify(text: string, taxonomy: Taxonomy): Promise<CategoryClassification | null> {
-    const cacheKey = `${taxonomy.version}:${normalizeDirectoryRequest(text)}`;
+    const candidates = findCategoryCandidates(text, taxonomy.categories);
+    if (!candidates.length || !hasProviderRequestEvidence(text)) return null;
+    taxonomy = { ...taxonomy, categories: taxonomy.categories.filter((category) => candidates.includes(category.id)) };
+    const cacheKey = `${JSON.stringify(taxonomy)}:${normalizeDirectoryRequest(text)}`;
     if (this.cache.has(cacheKey)) return this.cache.get(cacheKey) ?? null;
 
     let result: CategoryClassification | null = null;
@@ -79,12 +94,13 @@ export class OllamaCategoryClassifier implements CategoryClassifier {
         body: JSON.stringify({
           model: this.model,
           stream: false,
+          think: false,
           keep_alive: this.keepAlive,
           options: { temperature: 0 },
           format: {
             type: 'object',
             properties: {
-              categoryId: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+              categoryId: { anyOf: [{ type: 'string', enum: candidates }, { type: 'null' }] },
               confidence: { type: 'number', minimum: 0, maximum: 1 },
             },
             required: ['categoryId', 'confidence'],

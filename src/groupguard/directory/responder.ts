@@ -1,3 +1,5 @@
+import { findCategoryCandidates, hasProviderRequestEvidence } from './request-policy.js';
+import { isProviderExcluded } from './provider-exclusions.js';
 import { createHash } from 'node:crypto';
 
 export interface DirectoryCategory {
@@ -110,7 +112,9 @@ function renderProvider(provider: DirectoryProvider, index: number): string {
   for (const contact of provider.contacts) lines.push(`   ${contact.label}: ${contact.value}`);
   if (provider.recommendation?.quote.trim()) {
     const attribution = provider.recommendation.attribution?.trim();
-    lines.push(`   _Recommended by a community member:_ “${provider.recommendation.quote.trim()}”${attribution ? ` (${attribution})` : ''}`);
+    lines.push(
+      `   _Recommended by a community member:_ “${provider.recommendation.quote.trim()}”${attribution ? ` (${attribution})` : ''}`,
+    );
   }
   return lines.join('\n');
 }
@@ -147,23 +151,42 @@ export class DirectoryResponder {
 
     let category = this.categoryByAlias.get(normalized);
     if (!category) {
+      const candidates = findCategoryCandidates(request.text, this.options.taxonomy.categories);
+      if (!candidates.length || !hasProviderRequestEvidence(request.text)) return null;
+      const candidateTaxonomy = {
+        ...this.options.taxonomy,
+        categories: this.options.taxonomy.categories.filter((candidate) => candidates.includes(candidate.id)),
+      };
       let classification: CategoryClassification | null;
       try {
-        classification = await this.options.classifier.classify(request.text, this.options.taxonomy);
+        classification = await this.options.classifier.classify(request.text, candidateTaxonomy);
       } catch {
         return null;
       }
-      if (!classification || classification.confidence < this.minimumConfidence) return null;
+      if (
+        !classification ||
+        !Number.isFinite(classification.confidence) ||
+        classification.confidence > 1 ||
+        classification.confidence < this.minimumConfidence ||
+        !candidates.includes(classification.categoryId)
+      )
+        return null;
       category = this.categoriesById.get(classification.categoryId);
       if (!category) return null;
     }
 
-    const eligible = this.options.snapshot.providers.filter((provider) => provider.categoryIds.includes(category.id));
+    const eligible = this.options.snapshot.providers.filter(
+      (provider) => provider.categoryIds.includes(category.id) && !isProviderExcluded(request.text, provider),
+    );
     const selected = selectProviders(eligible, request.messageId);
     return {
       categoryId: category.id,
       providerIds: selected.map((provider) => provider.id),
-      text: renderResponse(category, selected),
+      text:
+        selected.length === 0 &&
+        this.options.snapshot.providers.some((provider) => provider.categoryIds.includes(category.id))
+          ? `🤖 *${category.title}*\n\nNo other matching providers are currently listed.`
+          : renderResponse(category, selected),
     };
   }
 }

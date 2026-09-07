@@ -4,6 +4,9 @@ All notable changes to NanoClaw will be documented in this file.
 
 ## [Unreleased]
 
+- [BREAKING] Directory requests now require configured service evidence and a supported provider-seeking form before semantic classification. Generic contact wording cannot supply category evidence, and classifiers cannot select unrelated categories. Expand taxonomy aliases and verify local request forms using [the migration and rollback guide](docs/directory-request-evidence.md).
+- Directory replies honor explicit provider-name exclusions before recommendation ranking, including alternate names in parentheses.
+
 ## [2.3.0] - 2026-08-24
 
 - [BREAKING] **A new Slack experience — per-agent provisioned Slack apps, agent spawning from Slack, and UX improvements — is available to classic single-bot Slack installs.** Classic Slack keeps working unchanged; this gate asks for a decision, not a forced migration. New installs and non-Slack installs are unaffected. **Migration:** run `/migrate-slack-agents` — it detects classic state (exits cleanly otherwise) and either walks the upgrade or records the choice to stay on classic; both outcomes satisfy this requirement.
