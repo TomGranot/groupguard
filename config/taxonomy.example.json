@@ -4,11 +4,8 @@
     {
       "id": "home-repair",
       "title": "Home repair",
-      "aliases": ["handyman", "repair service"],
-      "examples": [
-        "Can anyone recommend somebody to repair a broken cabinet?",
-        "I need help fixing a door."
-      ]
+      "aliases": ["handyman", "repair service", "repair a broken cabinet", "fixing a door"],
+      "examples": ["Can anyone recommend somebody to repair a broken cabinet?", "I need help fixing a door."]
     },
     {
       "id": "wellness",

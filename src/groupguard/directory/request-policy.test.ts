@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { findCategoryCandidates, hasProviderRequestEvidence } from './request-policy.js';
 import { isProviderExcluded } from './provider-exclusions.js';
@@ -15,6 +16,17 @@ const taxonomy: Taxonomy = {
 };
 
 describe('service request evidence', () => {
+  it('lets each shipped taxonomy example reach its intended category and the model', () => {
+    const example = JSON.parse(
+      fs.readFileSync(new URL('../../../config/taxonomy.example.json', import.meta.url), 'utf8'),
+    ) as Taxonomy;
+    for (const category of example.categories) {
+      for (const text of category.examples || []) {
+        expect(findCategoryCandidates(text, example.categories)).toContain(category.id);
+        expect(hasProviderRequestEvidence(text)).toBe(true);
+      }
+    }
+  });
   it('requires service evidence instead of private-contact wording', () => {
     expect(findCategoryCandidates('מחפשת גן בחיפה, אפשר תשובה בפרטי?', taxonomy.categories)).toEqual(['childcare']);
     expect(findCategoryCandidates('שלחו פרטים נוספים בפרטי', taxonomy.categories)).toEqual([]);
