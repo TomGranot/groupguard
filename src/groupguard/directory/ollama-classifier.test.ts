@@ -6,7 +6,7 @@ import type { Taxonomy } from './responder.js';
 const taxonomy: Taxonomy = {
   version: 'example-v1',
   categories: [
-    { id: 'home-moving', title: 'Home moving', aliases: ['movers'], examples: ['Who can move a sofa?'] },
+    { id: 'home-moving', title: 'Home moving', aliases: ['movers', 'relocate'], examples: ['Who can move a sofa?'] },
     { id: 'home-repair', title: 'Home repair', aliases: ['handyman'], examples: ['I need a shelf fixed.'] },
   ],
 };
@@ -20,9 +20,9 @@ function ollamaResponse(content: string): Response {
 
 describe('Ollama category classifier', () => {
   it('asks qwen3:4b to choose only from the closed taxonomy', async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(
-      ollamaResponse(JSON.stringify({ categoryId: 'home-moving', confidence: 0.91 })),
-    );
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(ollamaResponse(JSON.stringify({ categoryId: 'home-moving', confidence: 0.91 })));
     const classifier = new OllamaCategoryClassifier({ fetchImpl });
 
     await expect(classifier.classify('Could someone relocate my sofa?', taxonomy)).resolves.toEqual({
@@ -39,23 +39,25 @@ describe('Ollama category classifier', () => {
   });
 
   it('rejects malformed output and category IDs outside the taxonomy', async () => {
-    const malformed = new OllamaCategoryClassifier({ fetchImpl: vi.fn().mockResolvedValue(ollamaResponse('not json')) });
+    const malformed = new OllamaCategoryClassifier({
+      fetchImpl: vi.fn().mockResolvedValue(ollamaResponse('not json')),
+    });
     const unknown = new OllamaCategoryClassifier({
       fetchImpl: vi.fn().mockResolvedValue(ollamaResponse(JSON.stringify({ categoryId: 'unknown', confidence: 0.99 }))),
     });
 
-    await expect(malformed.classify('Anything', taxonomy)).resolves.toBeNull();
-    await expect(unknown.classify('Anything', taxonomy)).resolves.toBeNull();
+    await expect(malformed.classify('Can anyone recommend movers?', taxonomy)).resolves.toBeNull();
+    await expect(unknown.classify('Can anyone recommend movers?', taxonomy)).resolves.toBeNull();
   });
 
   it('caches repeated normalized messages for one taxonomy version', async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(
-      ollamaResponse(JSON.stringify({ categoryId: 'home-repair', confidence: 0.88 })),
-    );
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(ollamaResponse(JSON.stringify({ categoryId: 'home-repair', confidence: 0.88 })));
     const classifier = new OllamaCategoryClassifier({ fetchImpl });
 
-    await classifier.classify('Fix a shelf!', taxonomy);
-    await classifier.classify('  fix a shelf  ', taxonomy);
+    await classifier.classify('Can anyone recommend a handyman!', taxonomy);
+    await classifier.classify('  can anyone recommend a handyman  ', taxonomy);
 
     expect(fetchImpl).toHaveBeenCalledOnce();
   });

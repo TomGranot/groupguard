@@ -1,16 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import {
-  DirectoryResponder,
-  type CategoryClassifier,
-  type DirectorySnapshot,
-  type Taxonomy,
-} from './responder.js';
+import { DirectoryResponder, type CategoryClassifier, type DirectorySnapshot, type Taxonomy } from './responder.js';
 
 const taxonomy: Taxonomy = {
   version: 'example-v1',
   categories: [
-    { id: 'home-moving', title: 'Home moving', aliases: ['movers', 'moving company'] },
+    { id: 'home-moving', title: 'Home moving', aliases: ['movers', 'moving company', 'relocate'] },
     { id: 'home-repair', title: 'Home repair', aliases: ['handyman'] },
   ],
 };
